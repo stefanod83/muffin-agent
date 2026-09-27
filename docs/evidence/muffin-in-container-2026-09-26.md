@@ -59,6 +59,95 @@ Altri fatti misurati:
   con `sudo`) non è leggibile dall'utente 1000 del container, e `init` si ferma
   con `Permission denied`.
 
+## Tetti di risorse del container
+
+La sandbox limita il tempo (timeout con kill del gruppo di processi) e l'output
+(30.000 caratteri), non memoria né processi: bubblewrap non crea un cgroup, e
+nemmeno la unit systemd dell'installazione nativa imposta `TasksMax` o
+`MemoryMax`. Un comando che forka o alloca senza fine consuma le risorse di chi
+ospita il gateway. Nel percorso container la risposta è un tetto sul cgroup del
+container, che i processi della sandbox ereditano.
+
+Misurato su WSL2 (Docker Engine 29.8, cgroup v2, driver `systemd`):
+
+- con `pids_limit` i processi lanciati **dentro bubblewrap** contano nello
+  stesso tetto: `pids.events` registra i fork rifiutati;
+- quando bubblewrap esce, il suo PID namespace muore e i figli spariscono
+  subito; i processi orfani fuori dalla sandbox restano zombie e occupano il
+  tetto se il PID 1 non li raccoglie (misurato con `node` come PID 1), mentre nel
+  container vero il PID 1 è `tini` e li raccoglie;
+- con il solo `mem_limit` Docker concede altrettanto swap (`memory.swap.max`
+  uguale alla memoria): `memswap_limit` uguale a `mem_limit` rende il tetto reale;
+- al tetto di memoria l'OOM killer uccide il processo più grande: un processo che
+  alloca 1,5 GiB muore (exit 137) e il gateway resta in piedi;
+- il tetto conta thread, non solo processi: a riposo il container ha 9 task
+  (`tini`, il gateway `node` con 7 thread, il processo che legge il contatore),
+  89-229 MiB.
+
+Misurato nella review indipendente del 2026-09-27, con l'executor di produzione
+(`SandboxExecutor`) dentro il container e tetto a 1g:
+
+- un fork storm tiene `pids.current` fermo al tetto per tutta la durata del
+  comando; nel frattempo nessun altro processo del container può forkare (note
+  vocali, server MCP, il comando successivo) fino al timeout del comando (120 s
+  di default, 600 al massimo);
+- 14 processi da 90 MiB, ciascuno sotto il gateway: l'OOM killer uccide il
+  gateway, il container si riavvia;
+- `dd` su `/dev/shm` dentro la sandbox: `/dev` e `/dev/shm` sono tmpfs scrivibili
+  creati da bubblewrap, le loro pagine contano nel cgroup ma non appartengono a
+  nessun processo, quindi l'OOM killer uccide il gateway;
+- non sono gli unici: nella sandbox sono tmpfs scrivibili e senza limite anche le
+  maschere che nascondono le directory dei segreti (le due `secrets` e
+  `/etc/ssh/ssh_config.d`), montate da sandbox-runtime con `--tmpfs`. Una
+  scrittura da 64 MiB è riuscita in ciascuna, in entrambe le corsie, e la memoria
+  del container è salita da 49 a 302 MiB con un processo da circa 3 MB di RSS
+  (seconda review indipendente, 2026-09-27). Senza tetto, quindi, un comando può
+  riempirne più d'uno, ciascuno fino a metà della RAM, e portare l'intero host in
+  OOM: la deduzione precedente («si fermerebbe a metà della RAM») sbagliava nel
+  verso pericoloso;
+- `.State.OOMKilled` non è un indicatore affidabile: se il processo ucciso è il
+  principale e il container riparte, torna `false` subito dopo il riavvio;
+  `docker events --filter event=oom` registra ogni kill (misurato nella stessa
+  review);
+- lo stop di default di Docker (10 s) è più corto del drain del gateway (60 s): un
+  `docker compose stop` durante un turno uccide il drain, e dopo il riavvio vale
+  lo stesso difetto del lock descritto sotto. Il compose imposta
+  `stop_grace_period: 75s`, come il `TimeoutStopSec` della unit systemd;
+- dopo il riavvio il gateway può rifiutarsi di partire con `un gateway è già
+  attivo (pid 7)`: il lock (`core/lock/durable.ts`, `heldBy`) giudica vivo il
+  detentore dal solo pid, e in un container riavviato il nuovo gateway prende di
+  solito lo stesso pid. Il rifiuto dura finché l'ultimo heartbeat del detentore
+  morto non ha 30 minuti (6 × `STALE_AFTER_MS`). Misurato: circa 17 minuti di
+  riavvii, finiti solo perché un riavvio ha preso il pid 6. È un difetto del lock
+  che esiste per ogni kill del gateway in container, non introdotto dai tetti, ma
+  i tetti rendono il kill un esito previsto;
+- carico legittimo: ffmpeg e whisper-cli con il modello base su 60 s di audio,
+  23 task al massimo, `memory.peak` del container 627 MiB; un processo `node`
+  nudo (il minimo per un server MCP stdio) 43 MiB e 7 thread.
+
+Il tetto di memoria quindi scambia la protezione dell'host con la disponibilità
+del gateway: un comando fuori controllo non esaurisce l'host, ma in certe forme
+fa riavviare il gateway, e finché il lock non è corretto il riavvio può costare
+fino a 30 minuti.
+
+| | Candidata | Pro | Contro |
+|---|---|---|---|
+| A | tetti sul container nel compose (`pids_limit`, `mem_limit`, `memswap_limit`) | nessun codice, misurabile, vale anche per la sandbox | solo per il percorso container; il tetto è condiviso con il gateway |
+| B | limiti per comando nell'executor (`prlimit`) | vale anche per il nativo | `RLIMIT_NPROC` conta per utente, `RLIMIT_AS` per processo: nessuno dei due limita un albero di processi |
+| C | `TasksMax` e `MemoryMax` nella unit systemd | vale per il nativo, stesso meccanismo di A | cambia il supervisore: va proposto a monte |
+| D | nulla | zero manutenzione | ogni `shell_run` chiede conferma, ma un comando dall'aria innocua basta |
+
+Scelta: **A** qui, **C** proposta a monte. Complementi a monte: alzare
+`oom_score_adj` dei processi della sandbox (un processo può alzarlo senza
+privilegi), così l'OOM killer sceglie loro anche quando sono tanti e piccoli;
+limitare la dimensione dei tmpfs che la sandbox crea, perché nessun
+`oom_score_adj` libera pagine che non appartengono a un processo (in bubblewrap
+0.13.0 `--size` vale solo per `--tmpfs`: vale quindi per le maschere dei
+segreti, che possono anche essere rese di sola lettura con `--remount-ro`, non
+per il `/dev` creato da `--dev`, per cui serve un'altra strada);
+e un lock che riconosca il detentore anche dall'identità del processo (per
+esempio l'istante di avvio da `/proc`), non dal solo pid.
+
 ## Peer, per problema
 
 - OpenClaw (docs.openclaw.ai/install/docker, letto il 2026-09-26): percorso
@@ -70,8 +159,15 @@ Altri fatti misurati:
   un effetto collaterale: gli strumenti di file dentro il backend scrivono in una
   copia dello stato invece che nell'originale.
 
-Entrambi trattano Docker come percorso ufficiale, ed entrambi isolano i comandi
-**con Docker**: da dentro un container questo richiede il socket del daemon,
+- OpenJarvis (github.com/2ITFounder/OpenJarvis, letto il 2026-09-26): esegue il
+  codice in un container per esecuzione, avviato con la CLI o l'SDK Docker, con
+  512 MB, 1 CPU, 100 processi, root in sola lettura e `/tmp` in tmpfs. Anche qui
+  serve il socket del daemon; il suo compose non lo monta, quindi in quel
+  percorso la sandbox non c'è. I tetti per esecuzione sono lo spunto ripreso
+  sopra, applicato al container del gateway.
+
+Tutti e tre trattano Docker come percorso ufficiale, e tutti e tre isolano
+l'esecuzione principale **con Docker**: da dentro un container questo richiede il socket del daemon,
 cioè l'equivalente di root sull'host, che `INSTALL.md` esclude. La strada qui è
 diversa: bubblewrap dentro il container, con permessi aggiuntivi opzionali e
 stretti.
@@ -107,6 +203,8 @@ Scelta: **A**.
   posture.
 - Con `compose.sandbox.yaml` su un host senza AppArmor il contenimento non
   riesce: la documentazione mentirebbe.
+- Un uso legittimo (trascrizione di note vocali, bridge MCP) che supera 512
+  processi o 2 GiB: i default sarebbero sbagliati, non solo stretti.
 - Sull'host Ubuntu 24.04 la sandbox contiene solo con il profilo
   `muffin-userns` insieme a `seccomp` e `systempaths=unconfined` (misurato). Se
   una versione di Docker o di AppArmor smettesse di permetterlo, la
