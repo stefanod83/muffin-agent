@@ -171,23 +171,31 @@ export type TurnCounters = {
  * continuable turn has not ended. Anything not in this union (answered,
  * aborted, denied, spent, refused, non-retryable provider failure, uncertain
  * effect) stays terminal through `finish`.
+ *
+ * Rows written before 2026-09-28 may carry `model_first_activity_timeout`:
+ * the 30s time-to-first-activity watchdog was removed (ADR-0092) and no
+ * writer produces that class any more. Readers keep treating the stored
+ * string opaquely — the union is the writers' vocabulary, not a guarantee
+ * about history.
  */
 export type ContinuableClass =
   | 'provider_empty'
   | 'truncated'
   | 'provider_transport'
-  | 'model_first_activity_timeout'
   | 'model_stall'
   | 'model_deadline'
   | 'turn_deadline'
   | 'active_model_budget'
-  | 'recovery_exhausted';
+  | 'recovery_exhausted'
+  | 'plan_open';
 
 /** Typed durable evidence carried by a `continuable` row. Never message content, never secrets. */
 export type ContinuableReason = {
   class: ContinuableClass;
   /** Which lease ended (0-based). */
   lease: number;
+  /** Granted plan rows still open behind a `plan_open` release: a count, never their text. */
+  openSteps?: number;
   /** Consecutive failed attempts behind the release, when the class counts them. */
   attempts?: number;
   /** Provider request ids behind the release, for the OpenRouter dashboard. */
@@ -466,8 +474,13 @@ export type TurnHealth = {
    * Turns whose lease ended recoverably and nobody continued yet (P0-B).
    * Unwindowed like `waiting`: a continuable row is owed work, however old —
    * the resolver's own TTL decides eligibility, not this inventory.
+   *
+   * `expired` splits the ones the resolver's TTL no longer reaches (only
+   * `muffin resume <id>` can continue them); `null` when the caller gave no
+   * `continuableSince`, so a caller that does not ask never reads a made-up
+   * zero.
    */
-  continuable: { count: number; oldest: string | null };
+  continuable: { count: number; oldest: string | null; expired: number | null };
   /**
    * Turns that finished with an answer and no address to send it to (D2,
    * judge round 2). Counted the same way `waiting` is — unwindowed, because a
@@ -699,6 +712,7 @@ function serializzaCheckpoint(checkpoint: unknown): string {
 export class TurnStore {
   private readonly insertStmt: Database.Statement | null;
   private readonly getStmt: Database.Statement;
+  private readonly latestActiveOfSessionStmt: Database.Statement;
   private readonly checkpointStmt: Database.Statement;
   private readonly deliveryStmt: Database.Statement;
   private readonly intentStmt: Database.Statement;
@@ -740,6 +754,7 @@ export class TurnStore {
     close: Database.Statement;
     leases: Database.Statement;
     continuable: Database.Statement;
+    continuableExpired: Database.Statement;
     setCandidates: Database.Statement;
     latestQuestion: Database.Statement;
   };
@@ -749,7 +764,7 @@ export class TurnStore {
     private readonly clock: () => Date = () => new Date(),
     /**
      * Injected so a test can exercise dead, live and reused holders. The
-     * default asks the holder's incarnation, then its pid (ADR-0092).
+     * default asks the holder's incarnation, then its pid (ADR-0094).
      */
     private readonly alive: Liveness = holderLiveness(db),
     /**
@@ -782,6 +797,18 @@ export class TurnStore {
                @replyTo, @jobId, @status, @pid, @claimedAt, @claimToken, @delivery, @now, @now)`,
     );
     this.getStmt = db.prepare(`SELECT * FROM turns WHERE id = ?`);
+    /**
+     * L'ultimo lavoro attivo di una conversazione, per la delega (issue #740).
+     *
+     * Attivo = non finito: in coda, in corso, sospeso, interrotto o
+     * continuabile. Un lavoro `done` è finito e non si delega più — la delega
+     * vale per il lavoro a cui la si dà, non per «questa chat da ora in poi».
+     */
+    this.latestActiveOfSessionStmt = db.prepare(
+      `SELECT * FROM turns
+        WHERE session_id = ? AND status IN ('runnable','running','waiting','interrupted','continuable')
+        ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+    );
     // Fenced on `claim_token` (P19's second finding): a checkpoint from a
     // process that has been stolen from must change zero rows, not overwrite
     // whatever the new holder has already written. `changes` is read back by
@@ -1007,6 +1034,7 @@ export class TurnStore {
     close: Database.Statement;
     leases: Database.Statement;
     continuable: Database.Statement;
+    continuableExpired: Database.Statement;
     setCandidates: Database.Statement;
     latestQuestion: Database.Statement;
   } {
@@ -1053,6 +1081,15 @@ export class TurnStore {
         `UPDATE turns SET status = 'running', claimed_by = @pid, claimed_at = @now, claim_token = @token,
                           messages = @messages, taint = @taint, counters = @counters,
                           lease_index = @leaseIndex, continuable_reason = NULL,
+                          -- La consegna scalare descrive la RISPOSTA della lease
+                          -- corrente: la lease nuova non ha ancora consegnato
+                          -- nulla, e l'esito della precedente resta nella sua
+                          -- riga di turn_leases. Senza questo azzeramento,
+                          -- un crash fra la risposta della lease N+1 e la sua
+                          -- consegna faceva leggere a recover il sent del
+                          -- diagnostico della lease N e chiudeva senza mai
+                          -- mandare la risposta (review 2026-09-28).
+                          delivery = NULL,
                           updated_at = @now
          WHERE id = @id AND status = 'continuable'`,
       ),
@@ -1083,9 +1120,13 @@ export class TurnStore {
       ),
       /** Eligible continuable rows for one conversation, newest first. Principal matched in JS. */
       continuable: db.prepare(
-        `SELECT id, principal, updated_at, continuable_reason FROM turns
+        `SELECT id, principal, updated_at, continuable_reason, input_text FROM turns
          WHERE status = 'continuable' AND session_id = @session AND updated_at >= @since
          ORDER BY updated_at DESC`,
+      ),
+      /** Continuable rows the resolver's TTL no longer reaches — `doctor` names the split. */
+      continuableExpired: db.prepare(
+        `SELECT count(*) AS n FROM turns WHERE status = 'continuable' AND updated_at < @since`,
       ),
       leases: db.prepare(
         `SELECT turn_id AS turnId, lease_index AS leaseIndex, started_at AS startedAt, ended_at AS endedAt,
@@ -1489,14 +1530,15 @@ export class TurnStore {
     sessionId: string,
     principal: Principal,
     since: string,
-  ): { id: string; updatedAt: string; reason: ContinuableReason | null }[] {
+  ): { id: string; updatedAt: string; reason: ContinuableReason | null; inputText: string | null }[] {
     const rows = this.leaseArea().continuable.all({ session: sessionId, since }) as {
       id: string;
       principal: string;
       updated_at: string;
       continuable_reason: string | null;
+      input_text: string | null;
     }[];
-    const out: { id: string; updatedAt: string; reason: ContinuableReason | null }[] = [];
+    const out: { id: string; updatedAt: string; reason: ContinuableReason | null; inputText: string | null }[] = [];
     for (const row of rows) {
       let stored: Principal;
       try {
@@ -1513,7 +1555,7 @@ export class TurnStore {
           reason = null;
         }
       }
-      out.push({ id: row.id, updatedAt: row.updated_at, reason });
+      out.push({ id: row.id, updatedAt: row.updated_at, reason, inputText: row.input_text });
     }
     return out;
   }
@@ -1620,6 +1662,17 @@ export class TurnStore {
 
   get(id: string): TurnRecord | null {
     const row = this.getStmt.get(id) as Row | undefined;
+    return row ? toRecord(row) : null;
+  }
+
+  /**
+   * L'ultimo lavoro non finito di una conversazione — vedi
+   * `latestActiveOfSessionStmt`. È il lavoro a cui `/yolo` e soci si legano:
+   * quello che l'owner vede in flight (o in attesa di continuazione), mai uno
+   * `done`.
+   */
+  latestActiveOfSession(sessionId: string): TurnRecord | null {
+    const row = this.latestActiveOfSessionStmt.get(sessionId) as Row | undefined;
     return row ? toRecord(row) : null;
   }
 
@@ -2070,7 +2123,7 @@ export class TurnStore {
    * month would sit in `doctor` for ever, next to one from ten minutes ago that
    * actually wants looking at.
    */
-  health(options: { now?: Date; windowMs?: number } = {}): TurnHealth {
+  health(options: { now?: Date; windowMs?: number; continuableSince?: string } = {}): TurnHealth {
     const now = options.now ?? this.clock();
     const since =
       options.windowMs === undefined
@@ -2097,6 +2150,10 @@ export class TurnStore {
     );
     const waiting = this.waitingStmt.get() as { n: number; oldest: string | null };
     const continuable = this.continuableCountStmt.get() as { n: number; oldest: string | null };
+    const continuableExpired =
+      options.continuableSince === undefined
+        ? null
+        : (this.leaseArea().continuableExpired.get({ since: options.continuableSince }) as { n: number }).n;
     const undeliverable = this.undeliverableCountStmt.get() as { n: number };
     return {
       total,
@@ -2107,7 +2164,7 @@ export class TurnStore {
       // Same reasoning: a lease that ended recoverably last month is still
       // continuable work until the owner says otherwise or the resolver TTL
       // excludes it.
-      continuable: { count: continuable.n, oldest: continuable.oldest },
+      continuable: { count: continuable.n, oldest: continuable.oldest, expired: continuableExpired },
       // Same reasoning, same absence of a window: a reply nobody could send
       // last month is still a reply nobody sent.
       undeliverable: { count: undeliverable.n },
@@ -2167,13 +2224,17 @@ export function describeInterrupted(turn: InterruptedTurn): string {
 export function readTurnHealth(
   db: Database.Database,
   windowMs: number = DOCTOR_WINDOW_MS,
+  continuableSince?: string,
 ): TurnHealth | null {
   try {
     db.prepare(`SELECT 1 FROM turns LIMIT 1`).get();
   } catch {
     return null;
   }
-  return new TurnStore(db, () => new Date(), holderLiveness(db), { readOnly: true }).health({ windowMs });
+  return new TurnStore(db, () => new Date(), holderLiveness(db), { readOnly: true }).health({
+    windowMs,
+    ...(continuableSince === undefined ? {} : { continuableSince }),
+  });
 }
 
 /**

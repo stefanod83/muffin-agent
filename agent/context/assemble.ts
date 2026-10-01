@@ -158,45 +158,27 @@ export function visibleTools<T extends { capability: CapabilityId }>(
 }
 
 /**
- * The open plan, rendered for the turn that is about to run.
+ * Session plan evidence, not the current Turn's request or completion gate.
  *
- * **This function is the whole reason `todo` is a mechanism and not a table.**
- * A store with a writer and no reader is this repository's signature defect,
- * and here it would be a particularly pointless one: a plan the model is never
- * shown is a plan it re-derives from its own earlier prose, which is exactly
- * the step that goes missing across a compaction, a suspension or a crash.
- *
- * Three decisions are in the text below, and each is load-bearing:
- *
- *  - **It lives in the volatile tail, never in `SystemPrompts`.** The prompts
- *    above are built once at boot precisely so each class keeps a byte-identical
- *    cacheable prefix; a list that changes every turn placed in front of them
- *    would go cold on every message. So the loop pushes this next to recalled
- *    memory (`buildContext`), for the same reason recall rides there.
- *  - **Only the open items.** A finished step still in front of the model is an
- *    invitation to redo it. `done` rows stay in the table — nothing is deleted
- *    (`AGENTS.md` §I-8) — and `todo list` still shows them; what the turn is
- *    handed unasked is what is still owed.
- *  - **The completion criterion is stated, and it is deterministic.** requirements-status.md#wait-e-todo-sono-primitive-del-runtime-non-tool
- *    asks for one: "finished" is *every item out of `pending`/`retry`*, decided
- *    by reading rows, not by the model declaring itself done. It is written
- *    here because this is the only place the model reads about the plan at all.
- *
- * Empty in, empty out — a session with nothing open costs zero tokens, which is
- * what lets the loop call it unconditionally.
+ * These rows have real readers: the owner can ask for a brief, and an active
+ * Turn can inspect its plan after context compaction. They have no Turn/grant
+ * identity, so neither age nor an open state makes them executable obligations
+ * of every Turn in the session. Timed commitments use their existing due lane.
  */
 export function todoSection(open: TodoItem[]): string {
   if (open.length === 0) return '';
   return [
     '## Piano di questa conversazione',
     '',
-    'Questi passi li hai scritti tu con `todo` e sopravvivono ai riavvii. Sono aperti:',
+    'Stato persistente scritto con `todo`, disponibile come contesto:',
     '',
     renderTodos(open),
     '',
-    'Aggiorna lo stato con `todo set` appena qualcosa cambia — è la sola traccia che resta ' +
-      'se il processo muore. Il lavoro è finito quando nessun passo è più `pending` o `retry`.',
+    'Queste righe non sono una nuova richiesta e non decidono quando il turno è finito. ' +
+      'Usale quando servono alla richiesta corrente o quando l’owner chiede del piano; ' +
+      'la sola presenza di passi aperti non richiede di ricordarli, proporne la ripresa o eseguirli.',
   ].join('\n');
+
 }
 
 /**
@@ -740,6 +722,7 @@ const WORK_RULES = [
   '- I tool che hai sono quelli che vedi. Se per una cosa non ne hai uno, dillo così: non inventare una policy o un permesso che lo nasconderebbe.',
   "- Prima di rifare una chiamata che hai già fatto, chiediti cosa è cambiato. Se non è cambiato niente, la risposta ce l'hai già.",
   '- Se il lavoro richiede più passaggi, dì in una riga cosa stai per fare prima di partire. Non a metà, e non a cose fatte.',
+  '- Segui la richiesta del turno e le correzioni dell’owner. Il piano della conversazione è contesto: parlarne non significa concedere di eseguirlo.',
   '- Quando hai finito, rispondi e basta: non chiamare altri tool per abitudine.',
   '- Il tool dedicato viene prima della shell: leggi con `fs_read`/`fs_search`, ispeziona con `sys_inspect` o `process_list`, e se il compito nomina un servizio esterno (Linear, GitHub, …) cerca un tool caricato con quel nome prima di guardare nell\'ambiente o in un file di config. `shell_run` (sola lettura) resta l\'ultima risorsa per quello che nessun tool copre, e chiede sempre il sì, come `shell_run_write` — per "che modello ti sta eseguendo" concateni `sys_inspect`, non un comando: `fs_read("config.json")` poi, se serve, `shell_run` sul risultato, non il contrario. «Dimentica X» / «non considerarlo più vero»: `memory_forget` (prima con `query`, poi con gli id che ha restituito) — mai shell, sqlite o file.',
   // La riga sul recinto. Sta qui e non in `persona.md` perché è una regola
@@ -842,7 +825,7 @@ const WORK_RULES_V2 = [
   '',
   '## Quando mi fermo',
   '',
-  'Un lavoro con più passaggi non è finito al primo. Resta dovuto finché non è completato, annullato, reso impossibile, o finché non richiede una decisione che è sua — e continua a essere dovuto anche se il turno finisce, il processo muore o la superficie cambia.',
+  'Un lavoro con più passaggi non è finito al primo. In una ripresa continuo la richiesta del turno selezionato, rispettando le correzioni successive dell’owner e gli effetti già registrati. Il piano della conversazione è contesto: parlarne non significa concedere di eseguirlo.',
   '',
   'La durata non mi spaventa: quello che mi limita sono effetti, authority e sicurezza, non la lunghezza.',
   '',

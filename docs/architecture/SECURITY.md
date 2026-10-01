@@ -308,6 +308,39 @@ only place that knows which part of the turn raised the level. That line is
 context and never the cause: since ADR-0074 the tier produces no `ask` on the
 host row, and since ADR-0075 it produces no `deny` there either.
 
+### Who may consume an `ask` without interrupting: owner delegation (ADR-0095)
+
+An `ask` is owner-approvable by construction — the kernel said so when it
+asked instead of refusing. The owner can pre-consume the asks of **one piece
+of work** (`/yolo`), recorded per turn row in `delegation_modes`, resolved in
+the loop's `ask` branch after already-given answers and before any surface is
+asked. What delegation never does: turn a deterministic `deny` into an allow
+(the `deny` branch returns before the delegation hook), approve across works,
+sessions or tenants (a new work is a new row and inherits nothing), or let the
+model enable itself (only owner commands write the table; there is no
+capability for it). Every consumed ask still passes through the single
+`approvals` queue — one-use, withdrawn on turn end — marked
+`decided_by: 'delegation'`. `/manual` revokes from the next ask; `/auto`
+records the posture but keeps asking until a calibrated semantic judgment
+exists, so an uncalibrated envelope cannot silently execute.
+
+### What leaves the machine for a shadow judgment (ADR-0096)
+
+A second external destination exists only when the owner configures it
+(`judgment` section + `secret://` key; absent by default, and then no byte
+leaves and no row is written). When active, every owner-ask of the shell
+family is judged **beside** the question, never instead of it: the judgment
+cannot consume an ask, touch the kernel, or change what the owner decides.
+What is sent is the compact action envelope — the owner request, the
+capability and its effect row, the command/resource, the model's own
+description, taint, principal and the kernel's reason for asking — never the
+conversation, never the repository, and **redacted** with the same
+`redactText` the tracing layer uses, so a token riding inside a command
+leaves as `«redacted:N»`. The API key travels in the header and nowhere
+else. Every judgment — success, timeout, provider failure — lands in the
+durable `ask_judgments` queue joined to the approval and the effect outcome,
+because a failed judgment is calibration data too, not an incident.
+
 ### The tenant dimension: what a room may do (ADR-0073, 2026-09-06)
 
 Until 2026-09-06 the kernel had one answer to *may a remote tenant reach this
@@ -599,7 +632,7 @@ judgement about how dangerous commands are.
 
 `sys.shell` (`shell_run`) is the **read-only lane**: the whole host filesystem is
 readable minus a finite deny-read list (not just the project — §9.2 names what
-that costs), writes are confined to a scratch directory this
+that costs; narrowing it to workspace + justified paths is #734, non-P0), writes are confined to a scratch directory this
 process creates under the system temp dir and removes when the session ends, and
 direct IP networking is disabled. On Linux the AF_UNIX seccomp filter is
 requested and behaviorally verified (three-legged self-test: an unsandboxed

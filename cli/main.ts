@@ -8,6 +8,7 @@ import { ALL_API_KEY_NAMES, LEGACY_API_KEY_NAME } from '../core/config/providers
 import { cmdUndo } from './undo.js';
 import { cmdOrientamento } from './orientamento.js';
 import { cmdEffects } from './effects.js';
+import { cmdJudgments } from './judgments.js';
 import { defaultModels, isSameOrNestedPath, resolveLocalHome, runInit, type InitStep } from './init.js';
 import { SandboxExecutor } from '../core/sandbox/executor.js';
 import { seal, verify } from '../core/rot/verify.js';
@@ -28,6 +29,7 @@ import {
   MEMORY_USAGE,
 } from './memory.js';
 import { checkTemporalWindow, EVERY_INSTANT, normaliseDate } from '../core/memory/recall.js';
+import { assicuraVoce } from '../core/audio/trascrivi.js';
 import { cmdVaultAdd, cmdVaultCheck, cmdVaultLs, cmdVaultReindex, VAULT_USAGE } from './vault.js';
 import { cmdSurfaceDefault, cmdSurfaceDisable, cmdSurfaceEnable, cmdSurfaceList, SURFACE_USAGE } from './surface.js';
 import { cmdMcpAdd, cmdMcpList, cmdMcpRemove, MCP_USAGE } from './mcp.js';
@@ -274,6 +276,8 @@ async function main(rawArgv: string[]): Promise<number> {
       return cmdOrientamento(rest);
     case 'effects':
       return cmdEffects(rest);
+    case 'judgments':
+      return cmdJudgments(rest);
     case 'completion': {
       const script = completion(rest[0] ?? '');
       if (script === null) {
@@ -671,6 +675,17 @@ async function cmdInit(argv: string[]): Promise<number> {
   if (incomplete.length > 0) {
     process.stderr.write(`\nRilancia \`muffin init\` quando è risolto — riprende da dove si era fermato.\n`);
     return 1;
+  }
+
+  // Il fallback vocale, assicurato una volta sola e mai a sorpresa: solo se
+  // una superficie vocale è accesa (una CLI sola non scarica 142 MiB per
+  // niente), e senza far fallire l'init se la rete non c'è — il rimedio
+  // rumoroso a runtime resta l'ultima spiaggia.
+  try {
+    const riga = await assicuraVoce(home, loadConfig(home));
+    if (riga !== null) process.stderr.write(`${riga}\n`);
+  } catch (error) {
+    process.stderr.write(`voce: controllo modello whisper saltato (${error instanceof Error ? error.message : String(error)})\n`);
   }
 
   if (values.local) {

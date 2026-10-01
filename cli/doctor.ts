@@ -4,10 +4,17 @@ import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import DatabaseCtor from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
-import { CONSERVATIVE, loadProfiles, selectProfile } from '../agent/profiles/profile.js';
-import { audioAccettato } from '../agent/providers/modalita.js';
-import { wantsExplicitCache } from '../agent/providers/openai-compat.js';
+import { CONTINUATION_TTL_MS } from '../agent/loop.js';
+import {
+  CONSERVATIVE,
+  loadEffectiveProfiles,
+  ownerProfilesDir,
+  selectSourcedProfile,
+} from '../agent/profiles/profile.js';
+import { audioAccettato, immagineAccettata } from '../agent/providers/modalita.js';
+import { speaksReasoningEffort, wantsExplicitCache } from '../agent/providers/openai-compat.js';
 import { type VerificationResult, verifyInferenceRoute } from '../agent/providers/verify.js';
+import { profileEditPath } from '../agent/tools/capability-status.js';
 import { baseToolOrder } from '../agent/runtime.js';
 import { diagnoseSearch } from '../agent/tools/search.js';
 import { type Prerequisito, prerequisitiTrascrizione } from '../core/audio/trascrivi.js';
@@ -127,6 +134,12 @@ export type DoctorOptions = {
    * the developer's machine, not the product.
    */
   voce?: { accettaAudio?: () => Promise<boolean>; path?: string };
+  /**
+   * Come `voce.accettaAudio`: tri-stato (`true` vede, `false` non vede,
+   * `undefined` non misurabile), con lo stesso tetto di `probeAudio`, perché
+   * anche qui un provider che non risponde non deve tenere `doctor` appeso.
+   */
+  vista?: { vedeImmagini?: (modello: string) => Promise<boolean | undefined> };
   /**
    * Test-only: overrides the real `hardeningHolds(home)` probe for the
    * owner-binding remedy below, so the hardened branch runs in the suite
@@ -388,11 +401,28 @@ export async function runDoctor(
   // and a model silently falling back to the conservative floor — fewer
   // tools, a shorter horizon, every crutch on, possibly a 400 on every turn
   // (D4) — is exactly that class of thing.
-  const profileProblems: string[] = [];
-  const profiles = loadProfiles(options.profilesDir, (line) => profileProblems.push(line));
-  const resolvedProfile = selectProfile(config.models.main, profiles);
+  const ownerProblems: string[] = [];
+  const shippedProblems: string[] = [];
+  const effective = loadEffectiveProfiles(home, options.profilesDir, (line, origin) =>
+    (origin === 'owner' ? ownerProblems : shippedProblems).push(line),
+  );
+  const sourced = selectSourcedProfile(config.models.main, effective);
+  const resolvedProfile = sourced?.profile ?? CONSERVATIVE;
+  const provenienza =
+    sourced === undefined
+      ? 'nessun profilo matcha'
+      : sourced.origin === 'owner'
+        ? `owner: ${sourced.file.split('/').pop()}`
+        : `shipped: ${sourced.file.split('/').pop()}`;
+  // The dropped file lives in exactly one of the two stores: the remedy names
+  // the one(s) that spoke, never a guess.
+  const cartelleCadute = [
+    ...(ownerProblems.length > 0 ? [ownerProfilesDir(home)] : []),
+    ...(shippedProblems.length > 0 ? ['agent/profiles/'] : []),
+  ].join(' e ');
+  const profileProblems = [...ownerProblems, ...shippedProblems];
   if (profileProblems.length === 0) {
-    ok('model profile', `${config.models.main} -> ${resolvedProfile.name}`);
+    ok('model profile', `${config.models.main} -> ${resolvedProfile.name} · ${provenienza}`);
   } else if (resolvedProfile === CONSERVATIVE) {
     // D4: a problem fired AND the configured model landed on the floor
     // profile. Named with the cost, not just the fact — an owner reading
@@ -407,15 +437,15 @@ export async function runDoctor(
         // sono tempo e spesa a porre il limite.
         `${resolvedProfile.maxToolsExposed} tool esposti, ${resolvedProfile.maxToolCallsPerTurn === null ? 'nessun tetto numerico di tool call' : `${resolvedProfile.maxToolCallsPerTurn} call/turno`}, ` +
         `stampelle [${resolvedProfile.recovery.join(', ')}]`,
-      'ripara o rimuovi il profilo scartato sopra, sotto agent/profiles/',
+      `ripara o rimuovi il profilo scartato sopra, sotto ${cartelleCadute}`,
     );
   } else {
     // Something is wrong but the model in use was not the one that paid for
     // it — still worth a line, never a fail: the owner is not degraded today.
     warn(
       'model profile',
-      `${profileProblems.join(' · ')} — ${config.models.main} risolve comunque su "${resolvedProfile.name}"`,
-      'ripara o rimuovi il profilo scartato sopra, sotto agent/profiles/',
+      `${profileProblems.join(' · ')} — ${config.models.main} risolve comunque su "${resolvedProfile.name}" · ${provenienza}`,
+      `ripara o rimuovi il profilo scartato sopra, sotto ${cartelleCadute}`,
     );
   }
 
@@ -433,6 +463,25 @@ export async function runDoctor(
     ];
     if (pins.length > 0 && config.provider.routingForFamily !== undefined) {
       ok('model routing', `pin validati per la famiglia "${config.provider.routingForFamily}"`);
+    }
+  }
+
+  // Reasoning control (#789). Silent when nothing is configured: the default
+  // is "the server decides", and a line nobody asked for teaches people to skip
+  // doctor. When something IS configured, say whether it can reach the wire —
+  // a level on an endpoint that neither is OpenRouter nor declares a dialect is
+  // omitted, which is exactly the silent no-op this line exists to name.
+  if (config.provider.kind === 'openai-compat' && (config.provider.reasoningDialect !== undefined || config.thinking !== undefined)) {
+    const level = config.thinking !== undefined && config.thinking !== 'off' && config.thinking !== 'adaptive' && config.thinking !== 'unset';
+    const reaches = config.provider.reasoningDialect !== undefined || speaksReasoningEffort(config.provider.baseUrl);
+    if ((level || config.thinking === 'off') && !reaches) {
+      warn(
+        'reasoning',
+        `thinking ${config.thinking} non arriva a ${config.provider.baseUrl ?? 'questo endpoint'}: fuori da OpenRouter viene omesso`,
+        'imposta provider.reasoningDialect in config.json se il server capisce reasoning_effort',
+      );
+    } else {
+      ok('reasoning', `thinking ${config.thinking ?? 'profilo'}, dialetto ${config.provider.reasoningDialect ?? (speaksReasoningEffort(config.provider.baseUrl) ? 'openrouter (dall\'hostname)' : 'nessuno')}`);
     }
   }
 
@@ -615,6 +664,23 @@ export async function runDoctor(
       'ripristina rot/budgets.json dai default del repo e rifai `muffin rot reseal`',
     );
   }
+  // Shown only when there is something to say: declarations come from the
+  // seal (with the host:port that actually matches), and a malformed section
+  // warns because the calls it meant to free are being metered instead.
+  if (budgets.unmetered.length > 0) {
+    ok(
+      'endpoint non conteggiati',
+      `rot/budgets.json — ${budgets.unmetered.map((e) => (e.port === undefined ? e.host : `${e.host}:${e.port}`)).join(', ')}`,
+    );
+  } else if (budgets.unmeteredSource === 'fallback' && budgets.notes.some((n) => n.includes('unmetered'))) {
+    // Only when this section itself failed: a missing file already warns
+    // through the caps and quiet-hours checks above.
+    warn(
+      'endpoint non conteggiati',
+      `sezione unmetered non valida (${budgets.notes.join(' · ')}) — tutto resta a consumo`,
+      'correggi rot/budgets.json e rifai `muffin rot reseal`',
+    );
+  }
 
   // Key presence only. A network call costs money and needs an explicit opt-in.
   // *Which backend answered* is part of the check, not decoration: the read
@@ -788,7 +854,22 @@ export async function runDoctor(
           'run `muffin memory extract` to drain the backlog',
         );
       } else if (chunks === 0) {
-        warn('vector index', 'empty: recall is full-text only', 'run `muffin memory extract`');
+        // Indice vuoto, config valida: resta da distinguere «configurato» da
+        // «raggiungibile» (#738). Con l'embedder giù, `muffin memory extract`
+        // è un rimedio inerte — ripassa da `makeEmbedder` e non indicizza
+        // niente — quindi la riga deve nominare la causa, non solo il sintomo.
+        // La sonda è la stessa del ramo indicizzato: un embedding della parola
+        // «probe» con tetto, nessun effetto su indice o memoria.
+        const down = await probeEmbedder(options.embedderProbe, configurato);
+        if (down !== null) {
+          warn(
+            'vector index',
+            `empty: recall is full-text only, e l'embedder non risponde (${down}): niente di nuovo viene indicizzato`,
+            rimedioEmbedder(config),
+          );
+        } else {
+          warn('vector index', 'empty: recall is full-text only', 'run `muffin memory extract`');
+        }
       } else {
         // Contare non è chiedere. I due numeri dicono che ciò che è **già**
         // indicizzato è coerente; non dicono niente su ciò che verrà, e
@@ -1007,7 +1088,7 @@ export async function runDoctor(
     // call whose *outcome* was recorded and declares, rather than repeats, the
     // ones that were not — so the open question below is what a declared,
     // non-replayed call may have done to the world, never whether it runs.
-    const turns = readTurnHealth(db);
+    const turns = readTurnHealth(db, undefined, new Date(Date.now() - CONTINUATION_TTL_MS).toISOString());
     if (turns === null) {
       // Not a warning. The table is created by the first runtime that opens
       // this home, so its absence means "no turn has run here yet", which on a
@@ -1056,14 +1137,23 @@ export async function runDoctor(
      * una continuazione esplicita. `ok`, non `warn`: niente si è rotto, ma
      * solo un umano che legge questo può chiuderla ("riprendi" in
      * conversazione, o `muffin resume <id>`).
+     *
+     * Le righe oltre la finestra di ripresa non sono più raggiungibili in
+     * chat: dirle tutte "riprendibili" manderebbe l'owner a scrivere
+     * "riprendi" e ricevere una conversazione ordinaria. Il conteggio le
+     * separa, e la strada che resta è il comando esplicito.
      */
     if (turns !== null && turns.continuable.count > 0) {
       const oldest = turns.continuable.oldest;
       const due = oldest === null ? '' : ` · in attesa da ${oldest.slice(0, 16).replace('T', ' ')}`;
-      ok(
-        'turni continuabili',
-        `${turns.continuable.count} lease esaurite con lavoro salvato${due} · continua con "riprendi" o \`muffin resume <id>\``,
-      );
+      const expired = turns.continuable.expired ?? 0;
+      const live = turns.continuable.count - expired;
+      const liveText =
+        live > 0
+          ? `${live} riprendibili con "riprendi" o \`muffin resume <id>\``
+          : 'nessuna riprendibile in chat';
+      const expiredText = expired > 0 ? ` · ${expired} oltre la finestra di ripresa (solo \`muffin resume <id>\`)` : '';
+      ok('turni continuabili', `${turns.continuable.count} lease esaurite con lavoro salvato${due} · ${liveText}${expiredText}`);
     }
 
     /**
@@ -1382,10 +1472,17 @@ export async function runDoctor(
       `${ordineBase.length} tool entro il tetto di ${resolvedProfile.maxToolsExposed} del profilo "${resolvedProfile.name}"`,
     );
   } else {
+    const dove = profileEditPath(
+      resolvedProfile.name,
+      sourced?.origin ?? 'conservative',
+      sourced?.file === '' ? undefined : sourced?.file,
+    );
     warn(
       'capacità: tetto tool',
       `${tagliatiDalTetto.length} tool oltre il tetto di ${resolvedProfile.maxToolsExposed} del profilo "${resolvedProfile.name}" e quindi invisibili al modello — ${tagliatiDalTetto.join(', ')}`,
-      `alza maxToolsExposed in agent/profiles/${resolvedProfile.name}.json, oppure riduci quanti tool sono registrati prima di questi`,
+      dove === null
+        ? `il profilo conservativo non ha un file in cui alzare maxToolsExposed: un profilo che matcha il modello lo sostituirebbe, oppure riduci quanti tool sono registrati prima di questi`
+        : `alza maxToolsExposed in ${dove}, oppure riduci quanti tool sono registrati prima di questi`,
     );
   }
 
@@ -1482,6 +1579,36 @@ export async function runDoctor(
           `${mancanti.map((x) => x.why).join(' · ')} — la prima nota vocale fallirebbe`,
         mancanti.map((x) => x.rimedio).join('\n  → '),
       );
+    }
+  }
+
+  // Le foto arrivano solo da Telegram: è l'unica superficie che collega
+  // `vista` (Discord non chiama mai `ingestAttachment`, quindi non descrive
+  // né mostra — il suo allegato resta una riga "non indicizzato"). Stesse
+  // fonti del runtime, non una copia: `immagineAccettata` è la funzione che
+  // `decidiVista` chiama.
+  const superficiFoto = config.surfaces.enabled.filter((id) => id === 'telegram');
+  if (superficiFoto.length > 0) {
+    const vede = await probeVista(options.vista?.vedeImmagini, config.provider.baseUrl, modello);
+    if (vede === true) {
+      ok('vista', `${modello} vede le immagini: arrivano al modello`);
+    } else if (vede === false) {
+      const leggera = config.models.light;
+      const descrive =
+        leggera === modello
+          ? false
+          : await probeVista(options.vista?.vedeImmagini, config.provider.baseUrl, leggera);
+      if (descrive === true) {
+        ok('vista', `${modello} non vede le immagini: le descrive ${leggera}, sullo stesso endpoint`);
+      } else {
+        warn(
+          'vista',
+          `${modello} non vede le immagini${descrive === false ? ` e neanche ${leggera}` : ''}: le foto restano fuori dal turno`,
+          'passa con /model a un modello che vede le immagini',
+        );
+      }
+    } else {
+      ok('vista', `non so se ${modello} vede le immagini (endpoint non misurabile): vanno al modello come sempre`);
     }
   }
 
@@ -1874,6 +2001,33 @@ async function probeAudio(
     ]);
   } catch {
     return false;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * Il modello vede le immagini? Tri-stato come `immagineAccettata`: a
+ * differenza dell'audio, "non so" non cade su un ramo locale ma sulla strada
+ * di sempre — ed è una risposta onesta da riportare, non un buco da tappare.
+ */
+async function probeVista(
+  override: ((modello: string) => Promise<boolean | undefined>) | undefined,
+  baseUrl: string | undefined,
+  model: string,
+): Promise<boolean | undefined> {
+  const run = override ?? ((m: string) => immagineAccettata(baseUrl, m));
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      run(model),
+      new Promise<boolean | undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), AUDIO_PROBE_MS);
+        timer.unref();
+      }),
+    ]);
+  } catch {
+    return undefined;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }

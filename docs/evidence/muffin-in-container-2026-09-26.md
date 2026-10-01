@@ -59,6 +59,42 @@ Altri fatti misurati:
   con `sudo`) non è leggibile dall'utente 1000 del container, e `init` si ferma
   con `Permission denied`.
 
+## Contesto di build (2026-09-28, review di #729)
+
+La prima forma passava al builder la `.git` del checkout (contesto `.git`
+soltanto, poi un clone a profondità 1 nello stage di build). L'immagine finale
+non la conteneva, ma il layer dello stage di build e la cache di BuildKit sì:
+history, reflog, objects e `config`, che può portare un URL con credenziali ed
+esce dalla macchina con un export della cache. E da un worktree collegato, dove
+`.git` è un file, la build falliva. La review ha chiesto lo stesso invariante
+(commit esatto, niente file sporchi o non tracciati) senza `.git` nel contesto.
+
+Misurato in WSL2 (amd64, Docker 29.8.0) sul commit `34e51cbc`, con init reale e
+`muffin doctor` su volumi nuovi:
+
+- `git archive HEAD` in `docker build -`, con il Dockerfile dentro l'archivio:
+  accettato; nessuna voce `.git` nel contesto;
+- senza alcun `.git` nell'immagine `doctor` perde due cose: la riga `build`
+  diventa «nessun checkout Git: non so quale commit stia girando» e gli 11 file
+  di default copiati da `init` passano da «allineato a HEAD» a «nessun checkout
+  Git leggibile»: 12 avvisi permanenti su un'installazione sana. Anche la riga
+  di avvio dell'entrypoint diventa `build=unknown`;
+- ricostruendo nello stage di build l'oggetto commit (il testo grezzo di
+  `git cat-file commit`, passato nel contesto) sopra i file dell'archivio, lo
+  SHA è identico a quello dell'host, il repository è shallow con un commit,
+  senza remote, con la sola `config` di `git init`, e `doctor` è identico riga
+  per riga a quello della prima forma;
+- lo stesso stage confronta `git write-tree` con il tree del commit: un file in
+  più (`secret.env`) o un file tracciato modificato (`README.md`) nel contesto
+  fanno fallire la build con i due tree a confronto.
+
+Alternative scartate: il solo archivio (i 12 avvisi sopra); un worktree
+temporaneo (il suo file `.git` va escluso comunque, e la build scrive nel
+repository e va ripulita: il worktree di `muffin update` ha senso perché la
+release resta ed è ciò che gira, qui l'albero serve pochi secondi); far leggere
+a `doctor` un file di metadati al posto di git (tocca il codice runtime, fuori
+dal perimetro di questa PR).
+
 ## Tetti di risorse del container
 
 La sandbox limita il tempo (timeout con kill del gruppo di processi) e l'output
@@ -110,9 +146,9 @@ Misurato nella review indipendente del 2026-09-27, con l'executor di produzione
   `docker events --filter event=oom` registra ogni kill (misurato nella stessa
   review);
 - lo stop di default di Docker (10 s) è più corto del drain del gateway (60 s): un
-  `docker compose stop` durante un turno uccide il drain, e dopo il riavvio vale
-  lo stesso difetto del lock descritto sotto. Il compose imposta
-  `stop_grace_period: 75s`, come il `TimeoutStopSec` della unit systemd;
+  `docker compose stop` durante un turno uccide il drain, e il riavvio perde il
+  turno in corso. Il compose imposta `stop_grace_period: 75s`, come il
+  `TimeoutStopSec` della unit systemd;
 - dopo il riavvio il gateway può rifiutarsi di partire con `un gateway è già
   attivo (pid 7)`: il lock (`core/lock/durable.ts`, `heldBy`) giudica vivo il
   detentore dal solo pid, e in un container riavviato il nuovo gateway prende di
@@ -120,15 +156,22 @@ Misurato nella review indipendente del 2026-09-27, con l'executor di produzione
   morto non ha 30 minuti (6 × `STALE_AFTER_MS`). Misurato: circa 17 minuti di
   riavvii, finiti solo perché un riavvio ha preso il pid 6. È un difetto del lock
   che esiste per ogni kill del gateway in container, non introdotto dai tetti, ma
-  i tetti rendono il kill un esito previsto;
+  i tetti rendono il kill un esito previsto. **Aggiornamento (2026-09-30): il
+  difetto è chiuso in `dev` da #728 (ADR-0094)** — il detentore è giudicato vivo
+  dalla sua incarnazione (un lock di file che il kernel rilascia alla morte del
+  processo, SIGKILL e OOM compresi), non dal solo pid; il riavvio dopo un kill
+  duro riparte subito. La regola del pid resta come ripiego per i token scritti
+  prima di ADR-0094, che una home sopravvissuta a un'immagine vecchia può ancora
+  contenere. Le misure di questo documento restano quelle del 2026-09-26;
 - carico legittimo: ffmpeg e whisper-cli con il modello base su 60 s di audio,
   23 task al massimo, `memory.peak` del container 627 MiB; un processo `node`
   nudo (il minimo per un server MCP stdio) 43 MiB e 7 thread.
 
 Il tetto di memoria quindi scambia la protezione dell'host con la disponibilità
 del gateway: un comando fuori controllo non esaurisce l'host, ma in certe forme
-fa riavviare il gateway, e finché il lock non è corretto il riavvio può costare
-fino a 30 minuti.
+fa riavviare il gateway. Al momento della misura (26/09, prima di #728) il
+riavvio dopo un kill duro poteva costare fino a 30 minuti di rifiuti; dal 30/09
+il lock riconosce il detentore dall'incarnazione e il riavvio riparte subito.
 
 | | Candidata | Pro | Contro |
 |---|---|---|---|
@@ -145,8 +188,9 @@ limitare la dimensione dei tmpfs che la sandbox crea, perché nessun
 0.13.0 `--size` vale solo per `--tmpfs`: vale quindi per le maschere dei
 segreti, che possono anche essere rese di sola lettura con `--remount-ro`, non
 per il `/dev` creato da `--dev`, per cui serve un'altra strada);
-e un lock che riconosca il detentore anche dall'identità del processo (per
-esempio l'istante di avvio da `/proc`), non dal solo pid.
+e un lock che riconosca il detentore anche dall'identità del processo, non dal
+solo pid — **fatto**: #728/ADR-0094 (incarnazione: un lock di file per processo),
+integrato in `dev` il 2026-09-29.
 
 ## Peer, per problema
 

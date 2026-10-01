@@ -2,7 +2,7 @@ import DatabaseCtor from 'better-sqlite3';
 import { mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { runInit } from '../cli/init.js';
 import { loadConfig, paths, saveConfig, secretDir } from '../core/config/config.js';
 import { UndoJournal } from '../core/undo/journal.js';
@@ -860,6 +860,70 @@ describe('l\'embedder della config raggiunge la tabella vettoriale', () => {
 });
 
 
+describe('reasoning config reaches the providers that make the calls (#789)', () => {
+  it('config.provider.reasoningDialect reaches the wire on the main and the light lane, and config.thinking reaches the profile', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'muffin-dialect-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'muffin-dialect-ws-'));
+
+    runInit({
+      home,
+      apiKey: 'sk-fixture',
+      provider: 'openai-compat',
+      baseUrl: 'https://vllm.example.test/v1',
+      mainModel: 'qwen3.8-flash-next',
+      lightModel: 'qwen3.8-flash-next',
+    });
+    const before = loadConfig(home);
+    saveConfig({ ...before, thinking: 'medium', provider: { ...before.provider, reasoningDialect: 'reasoning_effort' } }, home);
+
+    // Behavioural, not structural: `runtime.light.provider` is a retry wrapper
+    // that does not expose the adapter under it, and the claim is about bytes —
+    // the memory lanes' `off` and the owner's level must reach the wire. The
+    // spy goes first: the SDK captures `fetch` when the client is constructed.
+    const bodies: Record<string, unknown>[] = [];
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((async (_url: unknown, init?: { body?: string }) => {
+      bodies.push(JSON.parse(init?.body ?? '{}'));
+      return new Response(
+        JSON.stringify({ id: 'x', model: 'm', choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as never);
+    let runtime: ReturnType<typeof buildRuntime>;
+    try {
+      runtime = buildRuntime(home, workspace);
+      const call = { model: 'qwen3.8-flash-next', maxOutputTokens: 10, stream: false, system: [{ type: 'text' as const, text: 's' }], messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'q' }] }] };
+      await runtime.light.provider.chat({ ...call, thinking: 'off' });
+      await runtime.deps.provider.chat({ ...call, reasoning: { mode: 'on', effort: 'medium' } });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+    expect(bodies[0]?.reasoning_effort).toBe('none');
+    expect(bodies[1]?.reasoning_effort).toBe('medium');
+    expect(runtime.deps.profile.thinking).toBe('medium');
+    runtime.close();
+  });
+
+  it('without the config fields a self-hosted endpoint keeps the behaviour it always had', () => {
+    const home = mkdtempSync(join(tmpdir(), 'muffin-nodialect-'));
+    const workspace = mkdtempSync(join(tmpdir(), 'muffin-nodialect-ws-'));
+
+    runInit({
+      home,
+      apiKey: 'sk-fixture',
+      provider: 'openai-compat',
+      baseUrl: 'https://vllm.example.test/v1',
+      mainModel: 'qwen3.8-flash-next',
+      lightModel: 'qwen3.8-flash-next',
+    });
+
+    const runtime = buildRuntime(home, workspace);
+
+    expect((runtime.deps.provider as unknown as { reasoningDialect?: unknown }).reasoningDialect).toBeUndefined();
+    expect((runtime.light.provider as unknown as { reasoningDialect?: unknown }).reasoningDialect).toBeUndefined();
+    runtime.close();
+  });
+});
+
 describe('main model config is a turn-boundary input', () => {
   it('a fresh queued turn sees a model and routing change written after this runtime booted', () => {
     const home = mkdtempSync(join(tmpdir(), 'muffin-live-model-'));
@@ -1165,4 +1229,170 @@ describe('la corsia light riporta i tentativi fisici nelle tracce (#496)', () =>
     expect(richieste.size).toBe(1);
     expect([...richieste][0]).toBeDefined();
   }, 60_000);
+});
+
+describe('billing identity: requested route vs served model (#499)', () => {
+  const owner: Principal = { kind: 'owner', connector: 'cli', externalId: 'local' };
+  const usage = { inputTokens: 10_000, outputTokens: 2_000, cacheReadTokens: 0, cacheWriteTokens: 0 };
+
+  async function billedFor(mainModel: string, baseUrl: string, served: string) {
+    const home = mkdtempSync(join(tmpdir(), 'muffin-billing-'));
+    runInit({
+      home,
+      apiKey: 'sk-or-test-never-called',
+      provider: 'openai-compat',
+      baseUrl,
+      mainModel,
+      lightModel: 'qwen/qwen3.7-flash',
+    });
+    const runtime = buildRuntime(home, mkdtempSync(join(tmpdir(), 'muffin-billing-ws-')));
+    const stub: Provider = {
+      kind: 'openai-compat',
+      async chat(): Promise<ChatResult> {
+        return { text: 'fatto', toolCalls: [], stopReason: 'end', usage, model: served };
+      },
+    };
+    try {
+      const result = await runTurn(
+        { ...runtime.deps, provider: stub },
+        {
+          principal: owner,
+          tenant: 'host',
+          surface: 'cli',
+          session: runtime.deps.sessions.open('billing-499'),
+          text: 'ciao',
+        },
+      );
+      expect(result.stopped).toBe('answered');
+      const usd = runtime.budget.monthToDateUsd();
+      const db = new DatabaseCtor(paths(home).db, { readonly: true });
+      try {
+        const rows = db.prepare('SELECT model, usd FROM spend').all() as { model: string; usd: number }[];
+        return { usd, rows };
+      } finally {
+        db.close();
+      }
+    } finally {
+      runtime.close();
+    }
+  }
+
+  it('bills $0 for a main-lane call requested through openrouter/free, keeping the served model on the row', async () => {
+    const { usd, rows } = await billedFor(
+      'openrouter/free',
+      'https://openrouter.ai/api/v1',
+      'qwen/qwen3.8-27b',
+    );
+    expect(usd).toBe(0);
+    expect(rows).toEqual([{ model: 'qwen/qwen3.8-27b', usd: 0 }]);
+  });
+
+  it('keeps served-model pricing for openrouter/auto', async () => {
+    const { usd } = await billedFor('openrouter/auto', 'https://openrouter.ai/api/v1', 'qwen/qwen3.8-27b');
+    expect(usd).toBeGreaterThan(0);
+  });
+
+  it('does not zero-bill a free slug on a non-OpenRouter endpoint', async () => {
+    const { usd } = await billedFor('openrouter/free', 'https://my-proxy.example/v1', 'qwen/qwen3.8-27b');
+    expect(usd).toBeGreaterThan(0);
+  });
+});
+
+describe('billing identity: owner-declared unmetered endpoints (#499)', () => {
+  const owner: Principal = { kind: 'owner', connector: 'cli', externalId: 'local' };
+  const usage = { inputTokens: 10_000, outputTokens: 2_000, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  const LAN = 'http://192.168.1.10:8080/v1';
+
+  // A sealed home whose rot/budgets.json declares unmetered endpoints, like an
+  // owner would after `muffin rot reseal`. The optional config poison proves
+  // the negative the whole slice stands on: a model-reachable config.json must
+  // never flip billing, only the seal decides.
+  function homeWithUnmetered(unmetered: unknown, configPoison?: unknown): string {
+    const home = mkdtempSync(join(tmpdir(), 'muffin-unmetered-'));
+    runInit({
+      home,
+      apiKey: 'sk-never-called',
+      provider: 'openai-compat',
+      baseUrl: LAN,
+      mainModel: 'qwen/qwen3.8-27b',
+      lightModel: 'qwen/qwen3.7-flash',
+    });
+    const file = join(paths(home).rot, 'budgets.json');
+    const budgets = JSON.parse(readFileSync(file, 'utf8'));
+    if (unmetered !== undefined) budgets.unmetered = unmetered;
+    writeFileSync(file, `${JSON.stringify(budgets, null, 2)}\n`);
+    seal(home, '1', new Date());
+    if (configPoison !== undefined) {
+      const configFile = paths(home).config;
+      const config = JSON.parse(readFileSync(configFile, 'utf8'));
+      (config as Record<string, unknown>).unmetered = configPoison;
+      writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`);
+    }
+    return home;
+  }
+
+  async function billedOn(home: string) {
+    const runtime = buildRuntime(home, mkdtempSync(join(tmpdir(), 'muffin-unmetered-ws-')));
+    const stub: Provider = {
+      kind: 'openai-compat',
+      async chat(): Promise<ChatResult> {
+        return { text: 'fatto', toolCalls: [], stopReason: 'end', usage, model: 'qwen/qwen3.8-27b' };
+      },
+    };
+    try {
+      const result = await runTurn(
+        { ...runtime.deps, provider: stub },
+        {
+          principal: owner,
+          tenant: 'host',
+          surface: 'cli',
+          session: runtime.deps.sessions.open('unmetered-499'),
+          text: 'ciao',
+        },
+      );
+      expect(result.stopped).toBe('answered');
+      const usd = runtime.budget.monthToDateUsd();
+      const db = new DatabaseCtor(paths(home).db, { readonly: true });
+      try {
+        const rows = db.prepare('SELECT model, usd FROM spend').all() as { model: string; usd: number }[];
+        return { usd, rows };
+      } finally {
+        db.close();
+      }
+    } finally {
+      runtime.close();
+    }
+  }
+
+  it('bills $0 through a sealed unmetered declaration, keeping the served model on the row', async () => {
+    const { usd, rows } = await billedOn(
+      homeWithUnmetered([{ host: '192.168.1.10', port: 8080, note: 'GPU LAN' }]),
+    );
+    expect(usd).toBe(0);
+    expect(rows).toEqual([{ model: 'qwen/qwen3.8-27b', usd: 0 }]);
+  });
+
+  it('keeps metering an endpoint the seal does not declare', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'muffin-unmetered-'));
+    runInit({
+      home,
+      apiKey: 'sk-never-called',
+      provider: 'openai-compat',
+      baseUrl: LAN,
+      mainModel: 'qwen/qwen3.8-27b',
+      lightModel: 'qwen/qwen3.7-flash',
+    });
+    const { usd } = await billedOn(home);
+    expect(usd).toBeGreaterThan(0);
+  });
+
+  it('a config.json declaration alone changes nothing: only the seal decides', async () => {
+    const { usd } = await billedOn(homeWithUnmetered(undefined, [{ host: '192.168.1.10', port: 8080 }]));
+    expect(usd).toBeGreaterThan(0);
+  });
+
+  it('a malformed sealed section fails safe to metered', async () => {
+    const { usd } = await billedOn(homeWithUnmetered('all'));
+    expect(usd).toBeGreaterThan(0);
+  });
 });

@@ -17,8 +17,10 @@ import {
   buildSystemPromptBlocks,
   renderSystemPrompts,
   tenantClass,
+  todoSection,
   visibleTools,
 } from './assemble.js';
+import type { TodoItem } from '../../core/turns/todo.js';
 
 /**
  * The prompt is a function of the tenant, and the tool list is a function of the
@@ -247,8 +249,16 @@ describe('the owner-class prompt does not move', () => {
    * diceva. Pin precedente:
    * `c1f6ed077218a15797b8536007e045aee75c6b11a8dc7312a379a56b2ff612c8`.
    */
+  /**
+   * Ri-fissato 2026-09-30 (`slice/plan-stale-no-autoresume`): `WORK_RULES`
+   * aggiunge la riga «un messaggio nuovo apre lavoro nuovo» — un piano aperto
+   * da ore non si riprende da solo (misurato: un «Buongiorno Muffin» ha fatto
+   * un'ora di lavoro su un piano `pending` della sera prima). Pin precedente:
+   * `205a51aaa4ea013b6351235dac6a3f0563ece1f876d68e2a68346ee961407605`.
+   */
   const OWNER_PROMPT_SHA_AT_SPLIT =
-    '205a51aaa4ea013b6351235dac6a3f0563ece1f876d68e2a68346ee961407605';
+    // #529: session plan rows are context, not a grant or Turn completion rule.
+    '0952125772949ff2d1db0866998a17cea8b38f68c4608b9b87872dcc56df28b2';
 
   it('è identico a se stesso fra due processi — o la cache non prende mai', () => {
     // Misurato prima di essere riparato: il recinto delle skill prendeva un
@@ -354,7 +364,15 @@ describe('the owner-class prompt does not move', () => {
    * voce («Struttura quando serve»). Pin precedente:
    * `96a4b8a78a874e21feadbb2cc09d314620a3ed912a6f6711854db78623b88737`.
    */
-  const GROUP_PROMPT_SHA_V1 = '63c6590ed366dbb44d9e2a5ce2b018f9f0ffe3993ec5ea34d555c46cddf0b3f4';
+  /**
+   * Ri-fissato 2026-09-30 (`slice/plan-stale-no-autoresume`) insieme al pin
+   * owner, per la stessa riga: `WORK_RULES` spedisce a tutte e due le classi,
+   * quindi la regola «un messaggio nuovo apre lavoro nuovo» arriva anche alla
+   * stanza. Pin precedente:
+   * `63c6590ed366dbb44d9e2a5ce2b018f9f0ffe3993ec5ea34d555c46cddf0b3f4`.
+   */
+  // #529: the same scoped-work rule reaches owner and group prompts.
+  const GROUP_PROMPT_SHA_V1 = '57857222d8b56eafa48d3a583489b6a1ffce30b164bb0881f91a3af7846264c8';
 
   it('e la stanza riceve lo stesso prompt di ieri, byte per byte', () => {
     const runtime = boot(bootHome());
@@ -477,7 +495,13 @@ describe('quale versione del prompt assembla questa installazione', () => {
     // Linux del giorno: disclosure non ha undo) — e accorcia la riga (2.031 →
     // 2.022), rapporto v1 9,57 (19.341 / 2.022) e v2 4,32 (17.301 / 4.001).
     // Soglie invariate: la misura regge, non è stata abbassata.
-    expect(v1.chiSei / v1.comeLavori).toBeGreaterThan(9);
+    // Ri-misurato 2026-09-30 (`slice/plan-stale-no-autoresume`): la riga «un
+    // messaggio nuovo apre lavoro nuovo» aggiunge testo a `WORK_RULES`
+    // (2.022 → ~2.192 caratteri), rapporto v1 8,89 (19.341 / ~2.192). Stessa
+    // regola: la soglia scende con la misura, e v1 resta pesantemente
+    // carattere contro il `< 8` di v2 — che è la riga che porta il peso
+    // dell'affermazione.
+    expect(v1.chiSei / v1.comeLavori).toBeGreaterThan(8.5);
     expect(v2.chiSei / v2.comeLavori).toBeLessThan(8);
     // E il prompt non è cresciuto per farlo: il peso si è spostato.
     expect(v2.chiSei + v2.comeLavori).toBeLessThan((v1.chiSei + v1.comeLavori) * 1.02);
@@ -864,5 +888,31 @@ describe('the tool list a principal is shown', () => {
     } finally {
       runtime.close();
     }
+  });
+});
+
+describe('session plans remain context, independent of age', () => {
+  const item = (updatedAt: string): TodoItem => ({
+    seq: 1, text: 'Build an unrelated animation.', state: 'pending', note: null,
+    tier: 0, dueAt: null, createdAt: updatedAt, updatedAt,
+  });
+
+  it('empty plans cost no context', () => {
+    expect(todoSection([])).toBe('');
+  });
+
+  it('keeps readable plan state without defining the current Turn completion', () => {
+    const out = todoSection([item('2026-09-30T09:30:00Z')]);
+    expect(out).toContain('Build an unrelated animation.');
+    expect(out).toContain('pending');
+    expect(out).toContain('contesto');
+    expect(out).not.toContain('Il lavoro è finito');
+    expect(out).not.toContain('chiedi prima');
+    expect(out).not.toContain('Sono aperti:');
+  });
+
+  it('age does not change which request the plan authorizes', () => {
+    expect(todoSection([item('2026-09-30T09:30:00Z')]))
+      .toBe(todoSection([item('2020-01-01T00:00:00Z')]));
   });
 });

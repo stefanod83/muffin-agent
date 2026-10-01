@@ -35,7 +35,7 @@ const finto = (over: Partial<InspectSources> = {}): InspectSources => ({
     checks: [{ name: 'vector index', level: 'ok', detail: 'in sync' }],
     exitCode: 0,
   }),
-  turns: () => ({ total: 3, waiting: { count: 1, oldestWakeAt: null }, continuable: { count: 0, oldest: null }, undeliverable: { count: 0 }, interrupted: [] }),
+  turns: () => ({ total: 3, waiting: { count: 1, oldestWakeAt: null }, continuable: { count: 0, oldest: null, expired: null }, undeliverable: { count: 0 }, interrupted: [] }),
   jobs: () => [],
   capabilityGaps: [],
   ...over,
@@ -115,5 +115,25 @@ describe('sys_inspect dice cosa sta usando adesso', () => {
       ({ capability, spec: { name, description: '', inputSchema: {} }, throwTier: 0, handler: () => ({ content: '', tier: 0 }) }) as RegisteredTool;
     const testo = await chiedi({ tools: [t('alpha', 'a'), t('beta', 'b')] });
     expect(testo).toContain('alpha, beta');
+  });
+
+  it('mostra da dove viene il profilo quando il runtime lo sa (#764)', async () => {
+    const testo = await chiedi();
+    const conOrigine = await makeInspectTool(finto()).handler(
+      {},
+      toolContext({
+        runtimeInfo: {
+          providerKind: 'openai-compat',
+          mainModel: 'my-lan-model',
+          lightModel: 'qwen/qwen3.7-flash',
+          profile: { ...CONSERVATIVE, name: 'owner-lan' },
+          profileSource: { origin: 'owner', file: '/home/muffin/profiles/owner-lan.json' },
+        },
+      }),
+    );
+    expect(conOrigine.content).toContain('profilo: owner-lan · owner (owner-lan.json)');
+    // Senza runtimeInfo la riga resta quella di sempre, senza suffissi inventati.
+    expect(testo).toContain('profilo: conservative — max');
+    expect(testo).not.toContain('profilo: conservative ·');
   });
 });

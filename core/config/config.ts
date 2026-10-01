@@ -1,9 +1,10 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { ensurePrivateDir, tightenPrivateFile } from './private-fs.js';
-import { z } from 'zod';
-import { SEARCH_PROVIDER_IDS } from './providers.js';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { z } from 'zod';
+import { ensurePrivateDir, tightenPrivateFile } from './private-fs.js';
+import { SEARCH_PROVIDER_IDS } from './providers.js';
+import { REASONING_DIALECTS, THINKING_VALUES } from './thinking.js';
 
 /**
  * One home, one config file, one database. Backup, export and "delete
@@ -73,6 +74,19 @@ export const ConfigSchema = z.object({
     /** `secret://name` — resolved through the secret store, never inlined here. */
     apiKeyRef: z.string().min(1),
     /**
+     * Come dire a un endpoint che **non** è OpenRouter di ragionare meno o
+     * niente (#789). Dichiarato dall'owner, mai dedotto dall'URL: la deduzione
+     * per hostname resta solo per OpenRouter, perché su Ollama/llama.cpp/vLLM
+     * il campo giusto dipende dal server e dal modello.
+     *
+     * Assente = quello che si è sempre fatto (niente sul filo fuori da
+     * OpenRouter). `reasoning_effort` manda il campo di primo livello che vLLM e
+     * Ollama documentano: `none` per `thinking: off`, altrimenti il livello di
+     * `thinking` così com'è — i livelli ammessi cambiano da server a server, e
+     * il validatore è il server.
+     */
+    reasoningDialect: z.enum(REASONING_DIALECTS).optional(),
+    /**
      * Le preferenze di instradamento, per un `baseUrl` che è uno **smistatore**
      * e non un modello.
      *
@@ -127,7 +141,11 @@ export const ConfigSchema = z.object({
      */
     routingForFamily: z.string().min(1).optional(),
   }),
-  models: z.object({ main: z.string().min(1), light: z.string().min(1), deep: z.string().min(1).optional() }),
+  models: z.object({
+    main: z.string().min(1),
+    light: z.string().min(1),
+    deep: z.string().min(1).optional(),
+  }),
   /**
    * Il ragionamento sul turno di conversazione, quando l'owner non vuole quello
    * che il profilo del suo modello dichiara.
@@ -147,7 +165,7 @@ export const ConfigSchema = z.object({
    * puro che ha già mangiato il tetto dei token una volta
    * (`core/memory/corsie-senza-reasoning.test.ts`).
    */
-  thinking: z.enum(['adaptive', 'off', 'unset']).optional(),
+  thinking: z.enum(THINKING_VALUES).optional(),
   /**
    * Absent means no web search, and the tool is simply not registered — the
    * same posture as the shell without a working sandbox. A capability that
@@ -221,6 +239,42 @@ export const ConfigSchema = z.object({
           apiKeyRef: z.string().min(1).optional(),
         })
         .optional(),
+    })
+    .optional(),
+  /**
+   * System One — il sensore semantico degli `ask` (issue #740, fase shadow;
+   * ADR-0096). **Spento per default e per assenza**: una config che non
+   * nomina questo campo non spinge un byte verso nessuno, e il comportamento
+   * del ramo `ask` resta quello di sempre.
+   *
+   * Quando c'è, l'runtime giudica **in shadow** ogni ask della famiglia
+   * shell: il verdetto tipizzato (con probabilità) finisce in
+   * `ask_judgments`, accanto alla decisione che l'owner prenderà comunque —
+   * mai al posto suo. Il giudizio non può consumare un ask, né toccare il
+   * kernel: la sovranità deterministica resta intera (ADR-0095/#607).
+   *
+   * Che cosa parte dalla macchina: l'envelope compatto dell'azione
+   * (richiesta dell'owner, capability e riga di effetto, comando/risorsa,
+   * descrizione del modello, taint e principal) — **redatto** con la stessa
+   * `redactText` del tracing, mai segreti, mai la conversazione intera. Chi
+   * lo accende lo fa sapendo questo; chi non lo accende non paga niente.
+   *
+   * `provider` è un literal perché l'interfaccia è di Muffin e TypeSafe è un
+   * adattatore, non il piano: altri provider arrivano come letterali nuovi,
+   * non come stringhe libere.
+   */
+  judgment: z
+    .object({
+      provider: z.literal('typesafe'),
+      /** `secret://name` — risolto dal registro dei segreti, mai inline. */
+      apiKeyRef: z.string().min(1),
+      baseUrl: z.string().url().optional(),
+      /** Il modello richiesto; assente = il default dell'adapter. */
+      model: z.string().min(1).optional(),
+      /** Timeout per tentativo; assente = quello dell'adapter. */
+      timeoutMs: z.number().int().positive().optional(),
+      /** Retries dopo il primo tentativo; assente = quello dell'adapter. */
+      maxRetries: z.number().int().min(0).max(5).optional(),
     })
     .optional(),
   // No `budget` here, deliberately. The caps are a rail, so they live inside the
@@ -324,7 +378,10 @@ export const ConfigSchema = z.object({
      */
     discord: z
       .object({
-        ownerUserId: z.string().regex(/^[0-9]+$/).optional(),
+        ownerUserId: z
+          .string()
+          .regex(/^[0-9]+$/)
+          .optional(),
         pairing: z
           .object({
             hash: z.string().min(1),
@@ -375,9 +432,11 @@ export const paths = (home = muffinHome()) => ({
    * Dove va il modello whisper, quando `config.audio.whisperModel` non lo dice.
    *
    * Un percorso e non un file: qui non lo scrive nessuno. Lo scarica l'owner —
-   * 142 MiB per `ggml-base.bin` — e `core/audio/trascrivi.ts` stampa il `curl`
-   * esatto quando non lo trova. Dentro la home e non in `rot/`: non e' una
-   * cosa dell'identita', e' un pezzo di macchina rimpiazzabile.
+   * 142 MiB per `ggml-base.bin` — oppure `init`, `surface enable` e il primo
+   * uso (`core/audio/trascrivi.ts`), che lo assicurano quando una superficie
+   * vocale è accesa; se manca comunque, `trascrivi` stampa il `curl` esatto.
+   * Dentro la home e non in `rot/`: non e' una cosa dell'identita', e' un
+   * pezzo di macchina rimpiazzabile.
    */
   whisperModel: join(home, 'models', 'ggml-base.bin'),
   // Outside the root of trust on purpose: the voice is the part that learns,
@@ -435,7 +494,10 @@ export const paths = (home = muffinHome()) => ({
  * closes, so the note says what was there and leaves the decision — and the
  * `muffin rot reseal` that carries it — to the owner.
  */
-function migrateV1(raw: Record<string, unknown>, note: (line: string) => void): Record<string, unknown> {
+function migrateV1(
+  raw: Record<string, unknown>,
+  note: (line: string) => void,
+): Record<string, unknown> {
   const { budget, ...rest } = raw;
   if (budget !== null && typeof budget === 'object') {
     const b = budget as { monthlyUsd?: unknown; perTenantDailyUsd?: unknown };
@@ -450,7 +512,10 @@ function migrateV1(raw: Record<string, unknown>, note: (line: string) => void): 
 }
 
 /** Indexed by the version being left behind, so the ladder reads in one direction. */
-const MIGRATIONS: Record<number, (raw: Record<string, unknown>, note: (line: string) => void) => Record<string, unknown>> = {
+const MIGRATIONS: Record<
+  number,
+  (raw: Record<string, unknown>, note: (line: string) => void) => Record<string, unknown>
+> = {
   1: migrateV1,
 };
 
@@ -512,7 +577,10 @@ export function loadConfig(home = muffinHome(), onNote: (line: string) => void =
     const issues = validated.error.issues
       .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
       .join('; ');
-    throw new ConfigError(`${file} is invalid — ${issues}`, 'fix those fields, or re-run `muffin init --force`');
+    throw new ConfigError(
+      `${file} is invalid — ${issues}`,
+      'fix those fields, or re-run `muffin init --force`',
+    );
   }
   return validated.data;
 }
@@ -580,9 +648,10 @@ export function locateSecret(ref: string, home = muffinHome()): SecretLocation |
 /** Every backend that holds this name. More than one means one is shadowing the other. */
 export function locateSecretAll(ref: string, home = muffinHome()): SecretLocation[] {
   const name = requireSecretRef(ref);
-  return SECRET_BACKENDS.map((backend) => ({ backend, path: join(secretDir(backend, home), name) })).filter(
-    (l) => existsSync(l.path),
-  );
+  return SECRET_BACKENDS.map((backend) => ({
+    backend,
+    path: join(secretDir(backend, home), name),
+  })).filter((l) => existsSync(l.path));
 }
 
 /**

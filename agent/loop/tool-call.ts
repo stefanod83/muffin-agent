@@ -415,7 +415,59 @@ export async function runTool(
         (deps.now ?? (() => new Date()))(),
       );
       if (gia === 'deny') return nega();
-      if (gia !== 'allow') {
+      /**
+       * La delega dell'owner consuma l'ask (issue #740).
+       *
+       * Il kernel ha già detto la sua: questo ramo si raggiunge solo per un
+       * verdetto `ask`, cioè un'azione che il proprietario potrebbe approvare.
+       * Un `deny` non arriva qui — lo `switch` lo ritorna prima — quindi **la
+       * delega non trasforma mai un divieto in permesso**: cambia solo come
+       * l'ask viene consumato.
+       *
+       * `yolo`: l'owner ha pre-approvato ogni ask di questo lavoro. La domanda
+       * si registra e si consuma **attraverso lo stesso registro** (`ask` poi
+       * `decide` poi `take`, come la risposta immediata del terminale) — mai
+       * accanto: la coda resta l'unica storia di cosa è passato, con
+       * `decided_by: 'delegation'` a dire chi ha deciso. Il loop prosegue come
+       * un ask approvato, e la riga d'intento sotto registra `decision: 'ask'`
+       * — il kernel aveva chiesto, e la delega ha risposto.
+       *
+       * Senza registro non si consuma: una domanda senza traccia è la forma che
+       * questa repo rifiuta dal giorno in cui esiste la coda.
+       */
+      const delega = deps.delega?.modo(ctx.turnId) ?? 'manual';
+      const adesso = (deps.now ?? (() => new Date()))();
+      if (delega === 'yolo' && gia !== 'allow' && deps.approvals !== undefined) {
+        const consumato = deps.approvals.ask(
+          {
+            turnId: ctx.turnId,
+            capability,
+            ...(request.resource === undefined ? {} : { resource: request.resource }),
+            prompt: request.prompt,
+            taint: request.taint,
+          },
+          adesso,
+        );
+        deps.approvals.decide(consumato, 'allow', adesso, 'delegation');
+        deps.approvals.take(
+          {
+            turnId: ctx.turnId,
+            capability,
+            ...(request.resource === undefined ? {} : { resource: request.resource }),
+          },
+          adesso,
+        );
+        span.setAttributes({
+          'muffin.policy.approval': 'allow',
+          'muffin.policy.delegation': 'yolo',
+        });
+      } else if (gia !== 'allow') {
+        // `auto`: la busta di System One è vuota finché il giudizio semantico
+        // non è calibrato (#740, fase 3: «unknown classes escalate») — quindi
+        // ogni ask sale all'owner, che è il comportamento sicuro della
+        // modalità, non una sua imitazione. Il giudice si innesta in questo
+        // ramo, mai nel kernel.
+        if (delega === 'auto') span.setAttributes({ 'muffin.policy.delegation': 'auto' });
         if (!deps.approve) {
           // No channel on this surface: the turn stops and says what it wanted,
           // rather than the tool reporting a failure it did not have.
@@ -442,8 +494,47 @@ export async function runTool(
             prompt: request.prompt,
             taint: request.taint,
           },
-          (deps.now ?? (() => new Date()))(),
+          adesso,
         );
+
+        /**
+         * System One giudica in shadow, accanto alla domanda (issue #740,
+         * fase 1; ADR-0096). Parte **dopo** la riga che la risposta
+         * dell'owner andrà a chiudere e **prima** che la superficie chieda:
+         * il giudizio non aspetta né ritarda la domanda, non la consuma, non
+         * cambia una virgola del percorso — lascia solo la riga
+         * `ask_judgments` che la fase 2 confronterà con la decisione reale
+         * dell'owner. L'intenzione si rilegge dalla riga del turno (una
+         * SELECT su un indice: l'ask è raro per definizione, non una corsia
+         * calda). Sotto `/yolo` non si giudica: non c'è domanda, quindi non
+         * c'è decisione owner da calibrare.
+         */
+        if (
+          deps.judgment !== undefined &&
+          approvalId !== undefined &&
+          deps.judgment.capabilities.has(capability)
+        ) {
+          const decl = deps.capabilities?.get(capability);
+          deps.judgment.shadow(
+            {
+              intent: deps.turns.get(ctx.turnId)?.inputText ?? null,
+              capability,
+              effectRow: decl?.effect ?? null,
+              risk: decl?.risk ?? null,
+              reversible: decl?.reversible ?? null,
+              rerunnable: decl?.rerunnable === true,
+              resource: request.resource,
+              description: request.description,
+              taint: snapshot.currentTaint(),
+              taintOrigin: snapshot.taintOrigin(),
+              principal: ctx.principal.kind,
+              tenant: ctx.tenant,
+              delegationMode: delega,
+              askPrompt: request.prompt,
+            },
+            { approvalId, turnId: ctx.turnId },
+          );
+        }
 
         const answer = await deps.approve(request, {
           surface: input.surface,

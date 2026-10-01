@@ -1,5 +1,6 @@
 import type DatabaseCtor from 'better-sqlite3';
 import { randomBytes } from 'node:crypto';
+import { ensureColumn } from '../lock/durable.js';
 import type { TrustTier } from '../policy/types.js';
 
 /**
@@ -67,7 +68,16 @@ CREATE TABLE IF NOT EXISTS approvals (
   asked_at    TEXT NOT NULL,
   decision    TEXT CHECK (decision IN ('allow','deny')),
   decided_at  TEXT,
-  consumed_at TEXT
+  consumed_at TEXT,
+  -- Chi ha deciso: l'owner sul pulsante, oppure la sua delega attiva per
+  -- questo lavoro (issue #740: yolo consuma gli ask attraverso lo stesso
+  -- registro, non accanto). Righe decise prima di questa colonna: solo
+  -- l'owner poteva decidere, quindi leggono 'owner'.
+  decided_by  TEXT CHECK (decided_by IN ('owner','delegation')),
+  -- Quando il turno è finito con la domanda ancora aperta: la riga non è
+  -- cancellata (niente si cancella) e non è decisa (nessuno ha risposto), ma
+  -- non è più una domanda — open la ignora e un tocco tardivo non decide.
+  withdrawn_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_turn ON approvals(turn_id, consumed_at);
 `;
@@ -83,6 +93,10 @@ export type ApprovalRow = {
   decision: 'allow' | 'deny' | null;
   decidedAt: string | null;
   consumedAt: string | null;
+  /** Solo quando `decision` non è null: chi ha risposto. */
+  decidedBy: 'owner' | 'delegation' | null;
+  /** Il turno è finito mentre la domanda era aperta: vedi `withdrawForTurn`. */
+  withdrawnAt: string | null;
 };
 
 type Raw = {
@@ -96,6 +110,8 @@ type Raw = {
   decision: string | null;
   decided_at: string | null;
   consumed_at: string | null;
+  decided_by: string | null;
+  withdrawn_at: string | null;
 };
 
 const read = (r: Raw): ApprovalRow => ({
@@ -109,6 +125,10 @@ const read = (r: Raw): ApprovalRow => ({
   decision: r.decision === 'allow' || r.decision === 'deny' ? r.decision : null,
   decidedAt: r.decided_at,
   consumedAt: r.consumed_at,
+  // Decisa ma senza autore: righe di prima della colonna, quando solo
+  // l'owner poteva decidere — vedi lo schema.
+  decidedBy: r.decision === null ? null : r.decided_by === 'delegation' ? 'delegation' : 'owner',
+  withdrawnAt: r.withdrawn_at,
 });
 
 export class ApprovalStore {
@@ -118,9 +138,29 @@ export class ApprovalStore {
   private readonly matchStmt: DatabaseCtor.Statement;
   private readonly consumeStmt: DatabaseCtor.Statement;
   private readonly openStmt: DatabaseCtor.Statement;
+  private readonly openRowsStmt: DatabaseCtor.Statement;
+  private readonly decidedUnconsumedStmt: DatabaseCtor.Statement;
+  private readonly withdrawStmt: DatabaseCtor.Statement;
+  private readonly openForStmt: DatabaseCtor.Statement;
 
   constructor(db: DatabaseCtor.Database) {
     db.exec(SCHEMA);
+    // `CREATE TABLE IF NOT EXISTS` non tocca una tabella che esiste già: su un
+    // database installato prima di questa colonna lo schema sopra è un no-op e
+    // ogni SELECT che la nomina fallirebbe. `ensureColumn` è lo stesso meccanismo
+    // di ogni altro store che ha aggiunto una colonna — con la sua gestione
+    // della corsa fra due connessioni (`duplicate column name`), che una copia
+    // locale di PRAGMA+ALTER non avrebbe.
+    ensureColumn(db, 'approvals', 'withdrawn_at', 'withdrawn_at TEXT');
+    // Stesso meccanismo, stessa ragione: la delega (#740) distingue chi ha
+    // deciso, e un database installato prima di questa riga deve leggerla
+    // senza che nessuno migri niente a mano.
+    ensureColumn(
+      db,
+      'approvals',
+      'decided_by',
+      "decided_by TEXT CHECK (decided_by IN ('owner','delegation'))",
+    );
     this.askStmt = db.prepare(
       `INSERT INTO approvals (id, turn_id, capability, resource, prompt, taint, asked_at)
        VALUES (@id, @turnId, @capability, @resource, @prompt, @taint, @askedAt)`,
@@ -136,7 +176,8 @@ export class ApprovalStore {
      * come «già risposto» invece che come un errore.
      */
     this.decideStmt = db.prepare(
-      `UPDATE approvals SET decision = @decision, decided_at = @at WHERE id = @id AND decision IS NULL`,
+      `UPDATE approvals SET decision = @decision, decided_at = @at, decided_by = @by
+        WHERE id = @id AND decision IS NULL AND withdrawn_at IS NULL`,
     );
     this.matchStmt = db.prepare(
       `SELECT * FROM approvals
@@ -147,15 +188,55 @@ export class ApprovalStore {
     );
     this.consumeStmt = db.prepare(`UPDATE approvals SET consumed_at = @at WHERE id = @id AND consumed_at IS NULL`);
     this.openStmt = db.prepare(
-      `SELECT * FROM approvals WHERE turn_id = ? AND decision IS NULL ORDER BY asked_at ASC LIMIT 1`,
+      `SELECT * FROM approvals WHERE turn_id = ? AND decision IS NULL AND withdrawn_at IS NULL
+        ORDER BY asked_at ASC LIMIT 1`,
+    );
+    /**
+     * Tutte le domande aperte di un turno, dalla più vecchia.
+     *
+     * La usa `/yolo` su un lavoro sospeso: un giro può averne lasciate due
+     * (#741), e decidere solo la prima significherebbe risvegliare il turno
+     * su una barriera che resta aperta.
+     */
+    this.openRowsStmt = db.prepare(
+      `SELECT * FROM approvals WHERE turn_id = ? AND decision IS NULL AND withdrawn_at IS NULL
+        ORDER BY asked_at ASC`,
+    );
+    this.openForStmt = db.prepare(
+      `SELECT * FROM approvals
+        WHERE turn_id = @turnId AND capability = @capability AND resource IS @resource
+          AND decision IS NULL AND withdrawn_at IS NULL
+        ORDER BY asked_at ASC LIMIT 1`,
+    );
+    this.withdrawStmt = db.prepare(
+      `UPDATE approvals SET withdrawn_at = @at
+        WHERE turn_id = @turnId AND decision IS NULL AND withdrawn_at IS NULL`,
+    );
+    this.decidedUnconsumedStmt = db.prepare(
+      `SELECT 1 AS uno FROM approvals WHERE turn_id = ? AND decision IS NOT NULL AND consumed_at IS NULL LIMIT 1`,
     );
   }
 
-  /** Registra una domanda e restituisce il suo id — che è anche la barriera del turno. */
+  /**
+   * Registra una domanda e restituisce il suo id — che è anche la barriera
+   * del turno.
+   *
+   * Se la **stessa** domanda (turno, capability, risorsa) è già aperta, ne
+   * riusa la riga: un re-ask — il modello rifà la chiamata dopo un risveglio —
+   * non deve creare una seconda domanda. Con due righe aperte la tastiera
+   * mostrerebbe l'ultima e la barriera di ripresa vedrebbe la prima, quella
+   * senza pulsanti, fino alla scadenza (#745).
+   */
   ask(
     req: { turnId: string; capability: string; resource?: string | undefined; prompt: string; taint: TrustTier },
     now: Date,
   ): string {
+    const aperta = this.openForStmt.get({
+      turnId: req.turnId,
+      capability: req.capability,
+      resource: req.resource ?? null,
+    }) as Raw | undefined;
+    if (aperta !== undefined) return aperta.id;
     // Esadecimale: l'id finisce dentro `approval:<id>` in `wait_for` e dentro
     // il `callback_data` di Telegram (64 byte in tutto), quindi non può
     // contenere `:` né avere una lunghezza a sorpresa.
@@ -178,17 +259,46 @@ export class ApprovalStore {
   }
 
   /**
-   * L'owner ha risposto.
+   * L'owner ha risposto — o la sua delega ha consumato la domanda (#740).
+   *
+   * `by` dice chi: `'owner'` il pulsante (anche il terminale), `'delegation'`
+   * l'ask consumato sotto `/yolo`. Il default è l'owner perché ogni chiamante
+   * esistente è un dito, e un dito che dimentica il parametro non deve
+   * diventare delega.
    *
    * Tre esiti distinti perché portano a tre messaggi diversi sul pulsante:
    * `ok` la risposta è stata presa, `already` qualcuno (o lo stesso dito) aveva
    * già risposto, `unknown` quell'id non esiste — un pulsante di un database
    * ricreato, o qualcosa che nessuno ha chiesto.
    */
-  decide(id: string, decision: 'allow' | 'deny', now: Date): 'ok' | 'already' | 'unknown' {
-    const changed = this.decideStmt.run({ id, decision, at: now.toISOString() }).changes;
+  decide(
+    id: string,
+    decision: 'allow' | 'deny',
+    now: Date,
+    by: 'owner' | 'delegation' = 'owner',
+  ): 'ok' | 'already' | 'unknown' | 'withdrawn' {
+    const changed = this.decideStmt.run({ id, decision, at: now.toISOString(), by }).changes;
     if (changed > 0) return 'ok';
-    return this.get(id) === null ? 'unknown' : 'already';
+    const row = this.get(id);
+    if (row === null) return 'unknown';
+    // Ritirata è diverso da «già risposto»: nessuno ha risposto, il turno è
+    // finito. Il messaggio del pulsante deve poterlo dire.
+    return row.withdrawnAt === null ? 'already' : 'withdrawn';
+  }
+
+  /**
+   * Il turno è finito con la domanda ancora aperta: la domanda si **ritira**.
+   *
+   * Non si cancella (la riga resta come traccia) e non si decide (nessuno ha
+   * risposto): smette di essere una domanda. `open` la ignora — quindi la
+   * guardia di ripresa non la vede più — e un tocco tardivo riceve
+   * `'withdrawn'` invece di decidere per un turno che non esiste più.
+   *
+   * Ritorna quante domande ha ritirato: zero è la risposta normale per un
+   * turno che non aveva domande aperte.
+   */
+  withdrawForTurn(turnId: string, now: Date): number {
+    return this.withdrawStmt.run({ turnId, at: now.toISOString() }).changes;
   }
 
   /** La barriera del turno: c'è una risposta per questa domanda? */
@@ -201,6 +311,24 @@ export class ApprovalStore {
   open(turnId: string): ApprovalRow | null {
     const row = this.openStmt.get(turnId) as Raw | undefined;
     return row === undefined ? null : read(row);
+  }
+
+  /** Tutte le domande aperte di un turno, dalla più vecchia — vedi `openRowsStmt`. */
+  openRows(turnId: string): ApprovalRow[] {
+    const rows = this.openRowsStmt.all(turnId) as Raw[];
+    return rows.map(read);
+  }
+
+  /**
+   * C'è una decisione presa e non ancora consumata per questo turno?
+   *
+   * È la firma di un risveglio **da click** (rispetto a uno da scadenza):
+   * l'owner ha deciso qualcosa, il tool non l'ha ancora consumato. La usano la
+   * ripresa per distinguere «una delle domande è stata decisa» da «è scaduto
+   * il tempo» (issue #741), senza leggere l'orologio del turno.
+   */
+  decidedUnconsumed(turnId: string): boolean {
+    return this.decidedUnconsumedStmt.get(turnId) !== undefined;
   }
 
   /**

@@ -134,6 +134,28 @@ describe('buildContext', () => {
     const ownerIndex = messages.findIndex((m) => m.origin === 'owner');
     expect(messages.indexOf(memory)).toBeLessThan(ownerIndex);
   });
+
+  it('the session plan remains evidence rather than work to resume', () => {
+    const messages = buildContext(
+      baseInput({ text: 'Buongiorno' }),
+      [],
+      openPlan,
+      noHistory,
+      new Date(2026, 8, 30, 9, 31, 0),
+      'm',
+      'p',
+      undefined,
+      undefined,
+      new Set(),
+    );
+    const work = messages.find((m) => m.origin === 'work')!;
+    const text = textOf(work.content);
+    expect(text).toContain('passo del piano');
+    expect(text).not.toContain('Sono aperti:');
+    expect(text).toContain('contesto');
+    expect(text).not.toContain('chiedi prima');
+    expect(text).not.toContain('Il lavoro è finito');
+  });
 });
 
 const openPlan: TodoItem[] = [

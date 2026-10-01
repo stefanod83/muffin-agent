@@ -23,6 +23,7 @@ import { TOOL_PHRASES, toolLine, toolPhrase, toolSubject } from '../agent/tool-p
 import { COMANDI as ELENCO_COMANDI, aiuto, debugCommand, eseguiComando, sembraComando, thinkingCommand } from '../agent/comandi.js';
 import type { Controlli, Verbosity } from '../agent/comandi.js';
 import { Pausa } from '../core/runtime/pausa.js';
+import { levaDelega } from '../core/runtime/delega.js';
 import { loadConfig, paths, saveConfig } from '../core/config/config.js';
 import { cmdModel } from './model.js';
 import { makeStatusLine, type StatusLine } from './status-line.js';
@@ -192,6 +193,8 @@ export function formatProgressLine(event: TurnEvent, verbosity: Verbosity): stri
         return `· modello: ${event.ms}ms, ${event.inputTokens}→${event.outputTokens} token, stop: ${event.stopReason}`;
       case 'model_status':
         return `· modello ${event.status}, ${Math.round(event.idleMs / 1000)}s inattivo`;
+      case 'model_retry':
+        return `· provider ${event.class} tentativo ${event.attempt}/${event.max} fra ${event.inMs}ms`;
       case 'tool_start':
         return `· ${event.name}…`;
       case 'tool_retry':
@@ -213,6 +216,10 @@ export function formatProgressLine(event: TurnEvent, verbosity: Verbosity): stri
       return null;
     case 'model_status':
       return event.status === 'stalled' ? `  ⚠ nessuna attività del modello da ${Math.round(event.idleMs / 1000)}s` : null;
+    // Stessa ragione di `tool_retry`, altro budget: l'attesa del re-drive va
+    // detta, o lo spinner fermo per due minuti sembra un guasto.
+    case 'model_retry':
+      return `  ↻ ${event.class === 'provider_empty' ? 'risposta vuota dal provider' : 'il provider non ha risposto'} — riprovo (${event.attempt}/${event.max}) tra ${Math.max(1, Math.round(event.inMs / 1000))}s`;
     // Nemmeno l'inizio di un tool: `statusFor` lo mostra vivo, e stampare
     // «cerco in memoria…» e poi «✓ cerco in memoria» sarebbe la stessa cosa
     // detta due volte.
@@ -787,6 +794,21 @@ export async function runRepl(
     },
     steer: () => false,
     pausa: { attiva: () => pausa.attiva(), metti: () => pausa.metti(), togli: () => pausa.togli() },
+    // La delega sul lavoro di questa sessione (issue #740). Senza spinta alla
+    // corsia: il REPL cede i turni al gateway (ADR-0035) e non riprende mai un
+    // turno da sé — la riga risvegliata la raccoglie la corsia al battito, o
+    // `muffin resume` a mano. La sessione si legge a ogni comando perché `/new`
+    // la ruota senza ricostruire le leve.
+    ...(runtime.deps.delega === undefined || runtime.deps.approvals === undefined
+      ? {}
+      : {
+          delega: levaDelega({
+            delega: runtime.deps.delega,
+            approvals: runtime.deps.approvals,
+            turns: runtime.deps.turns,
+            sessionId: () => session.id,
+          }),
+        }),
   };
 
   /**

@@ -11,8 +11,9 @@ What is here:
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | gateway image built from the **last commit** of this checkout: Node 22, upstream bubblewrap, socat, ripgrep, whisper.cpp + ffmpeg, uv |
-| `Dockerfile.dockerignore` | the build context is `.git` only, so untracked files (a key, a `.env`) and uncommitted edits never reach the image |
+| `build.sh` | builds the image from the **last commit** of this checkout and nothing else: the context is `git archive HEAD` plus the commit object, so the repository's `.git`, untracked files (a key, a `.env`) and uncommitted edits never reach the builder |
+| `Dockerfile` | the gateway image: Node 22, upstream bubblewrap, socat, ripgrep, whisper.cpp + ffmpeg, uv. It rebuilds the commit (same SHA) from the archived files and refuses a context that is not exactly its tree |
+| `Dockerfile.dockerignore` | keeps `.git` out if the checkout itself is passed to `docker build` by mistake; that build stops at its first step |
 | `compose.yaml` | the gateway; a one-shot `init` service for unattended setup; Ollama for memory embeddings as the optional `embeddings` profile; an optional model router, commented out |
 | `compose.sandbox.yaml` | opt-in override that lets the shell sandbox run inside the container |
 | `compose.apparmor.yaml` | opt-in override for hosts where AppArmor restricts user namespaces |
@@ -36,9 +37,11 @@ Measurements and alternatives behind these choices:
 ## Requirements
 
 - Docker Engine with Docker Compose v2 on Linux (the sandbox is Linux bubblewrap).
-- A regular `git clone` of this repository (not a linked worktree: the build
-  needs `.git` to be a directory). The image contains the last commit of the
-  checked-out branch; commit local changes before building them.
+- A `git clone` of this repository (a linked worktree works too). The image
+  contains the last commit of the checked-out branch and nothing else:
+  uncommitted changes and untracked files are left out (`build.sh` warns about
+  the ones `git status` shows, that is all but the ignored ones).
+  Commit local changes before building them.
 - A model provider: a key (OpenRouter, Anthropic) or an OpenAI-compatible
   endpoint such as a local Ollama.
 - About 2 GB of disk for the image; more for local models.
@@ -48,7 +51,7 @@ Measurements and alternatives behind these choices:
 From `contrib/docker/`:
 
 ```sh
-docker compose build
+./build.sh                                           # the image, tagged muffin-gateway:local
 docker compose run --rm -it gateway muffin init     # key asked with a masked prompt
 docker compose up -d
 docker compose logs -f gateway                       # shows `muffin doctor`, then the gateway
@@ -56,6 +59,13 @@ docker compose logs -f gateway                       # shows `muffin doctor`, th
 
 `muffin init` in a container can offer to install a systemd unit: answer no,
 there is no systemd in the container.
+
+The image is never built by `docker compose` (`compose.yaml` has no `build:`
+section and `pull_policy: never`): a compose build would send the checkout as it
+is. The commit it was built from is in the image's
+`org.opencontainers.image.revision` label, and `muffin doctor` names it.
+`MUFFIN_IMAGE` sets another tag, and extra options go to `docker build`
+(`./build.sh --build-arg NODE_IMAGE=...`).
 
 If you start the stack before `init`, the gateway waits and logs how to
 initialise it; it starts by itself once the home is initialised:
@@ -156,9 +166,11 @@ not the gateway:
   smaller than the gateway, or written to one of the sandbox's in-memory
   filesystems (`/dev` with `/dev/shm`, and the empty mounts that hide the secret
   directories), whose pages belong to no process, the largest process is the
-  gateway: it is killed and the container restarts (both measured). After such a
-  restart the gateway can refuse to start for up to 30 minutes (see
-  Troubleshooting).
+  gateway: it is killed and the container restarts (both measured). On restart
+  the new gateway probes the dead holder's incarnation — the file lock the
+  kernel releases when the process dies — and takes the lock immediately. The
+  pid fallback, which could refuse for up to 30 minutes (see Troubleshooting),
+  only applies to a lock taken by a build older than #728 (ADR-0094).
 
 Without the memory ceiling the same command is not harmless: each of those
 in-memory filesystems can grow to half of the host's memory, so one command can
@@ -168,8 +180,8 @@ command is bounded only by its timeout.
 Raise the ceilings with `MUFFIN_GATEWAY_PIDS_LIMIT` and
 `MUFFIN_GATEWAY_MEM_LIMIT` (for example `3g` for a larger whisper model). To
 remove one, delete its line from `compose.yaml`: that trades the host's
-protection for nothing on the gateway's side, since the lockout above follows
-any hard kill.
+protection for nothing on the gateway's side, since a hard kill takes down the
+gateway and the turn in flight either way.
 
 `stop_grace_period` is 75 s: on SIGTERM the gateway finishes the turn in flight
 for up to 60 s, and Docker's default 10 s would kill it mid-drain.
@@ -201,7 +213,7 @@ sudo aa-status | grep muffin-userns
 
 ## Operating it
 
-- **Update**: `git pull`, then `docker compose build && docker compose up -d`.
+- **Update**: `git pull`, then `./build.sh && docker compose up -d`.
   The volumes keep the home; the new image carries the new code.
 - **Backup**: `docker compose exec gateway muffin backup` writes into the `home`
   volume, under `backups/`; copy the `home` and `config` volumes for a full copy
@@ -219,7 +231,7 @@ sudo aa-status | grep muffin-userns
 | `not configured yet` | no `muffin init` yet | `docker compose exec -it gateway muffin init` |
 | in a shell command's result: `Cannot fork` (or `Resource temporarily unavailable` from other programs) | the process ceiling of the container | find the runaway command; raise `MUFFIN_GATEWAY_PIDS_LIMIT` only if the load is legitimate |
 | in a shell command's result: exit code 137 (`Killed`); or the gateway restarts; `docker events --filter container=<name> --filter event=oom --since 1h` lists the kills (`.State.OOMKilled` is reset when the container restarts) | the memory ceiling of the container | raise `MUFFIN_GATEWAY_MEM_LIMIT` if the load is legitimate, for example a larger whisper model |
-| after the gateway stopped uncleanly (an OOM kill, SIGKILL, a stop that outlasted the grace period): `un gateway è già attivo (pid N)`, N often 7, exit code 75, and the container restarts in a loop | the gateway lock judges a holder alive by its process id alone; in a restarted container the new gateway often gets the same id, so the dead holder's lock looks alive | none safe from outside the process: it recovers by itself once the dead holder's last heartbeat is 30 minutes old |
+| after the gateway stopped uncleanly: `un gateway è già attivo (pid N)`, exit code 75, and the container restarts in a loop | the lock was written by a build older than #728 (ADR-0094), which judged a holder by its pid alone; in a restarted container the new gateway often gets the same id, so the dead holder's lock looked alive | rebuild the image and restart: current builds judge the holder by its incarnation and take the lock at once. Without rebuilding, it recovers once the dead holder's last heartbeat is 30 minutes old |
 | the gateway restarts in a loop; `docker compose ps -a` shows exit code 78 | a permanent error: missing config, a rejected key, a Root of Trust that refuses. systemd leaves the gateway down on this code; Docker's restart policy has no per-code exception and keeps retrying | `docker compose stop gateway`, then `docker compose run --rm gateway muffin doctor` and `muffin rot verify` |
 | `bwrap: No permissions to create new namespace` | default seccomp profile | sandbox override |
 | `userns_denied ... RTM_NEWADDR` | AppArmor user-namespace restriction | load the profile, add `compose.apparmor.yaml` |
@@ -228,5 +240,7 @@ sudo aa-status | grep muffin-userns
 | container does not start after adding `compose.apparmor.yaml` | profile not loaded on an AppArmor host | load it, or drop that override |
 | `bubblewrap ... predates ... 0.12.0` | wrong image | rebuild from this Dockerfile |
 | init: `cannot open /run/secrets/muffin_provider_key: Permission denied` | the key file is not readable by uid 1000 (for example created with `sudo`, mode 0600) | own it by uid 1000, or mode 0644 inside a 0700 directory |
-| build: `.git is not a directory (linked worktree?)` | building from a `git worktree` | build from a regular clone |
+| build: `"/.muffin-build-commit": not found` | the checkout was passed to `docker build` or `docker compose build` | build with `./build.sh` |
+| build: `the build context is not the commit` | the context was not produced by `build.sh`, or was altered | build with `./build.sh` |
+| `docker compose up`: `No such image: muffin-gateway:local` | the image was not built yet | `./build.sh` |
 | a local change is missing from the image | the image is built from the last commit | commit it, then rebuild |

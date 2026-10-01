@@ -119,6 +119,10 @@ therefore related but not identical.
 Work does not own the truth of what happened in the outside world; that belongs
 to effects/evidence.
 
+A session plan remains context shared across requests. Pending rows alone do not
+grant execution or define a Turn's completion. A continuation resumes the selected
+durable Turn and its request, subject to subsequent owner corrections.
+
 ### Effects
 
 Effects own the transition between "we intend to do this" and "the world may or
@@ -144,9 +148,11 @@ decision. The model may interpret meaning and propose work; it does not grant
 itself authority.
 
 The Root of Trust and shipped policy configuration set constitutional floors.
-Familiarity with the owner does not raise authority. Any future reduction in
-supervision must be scoped, observable, revocable and evidence-backed rather
-than expressed as a global trust score.
+Familiarity with the owner does not raise authority. Any reduction in
+supervision is scoped, observable, revocable and evidence-backed rather than
+expressed as a global trust score: owner delegation modes (ADR-0095) consume
+`ask` verdicts per work — never `deny` — through the single approval queue,
+and die with the work they were given to.
 
 ## 3. Semantic planes and runtime topology are orthogonal
 
@@ -380,6 +386,61 @@ privacy transform, skill, Node/hardware bridge, MCP adapter). A single giant
 The detailed community/extension design is post-DAY-1 product work; current code
 continues to expose tools, skills and MCP without pretending the future package
 system already exists.
+
+### The executable-composition waist (from #606)
+
+The semantic architecture is strong; the recurring failure class has been
+elsewhere:
+
+> **the semantic architecture is better than the executable composition
+> architecture.**
+
+Symptoms: a runtime capability described in several parallel places;
+scheduler-only execution modes; inbound message → Turn/LLM as the implicit
+default; late registrations that force exposure recomputation; lease vs Turn vs
+lifetime state easy to confuse; boot-snapshot vs turn-snapshot vs live config
+encoded through one-off closures; self-inspection aimed at diagnostics rather
+than a structured runtime self-model.
+
+The desired narrow waist:
+
+```text
+RuntimeEvent
+    ↓
+AutomationRule / deterministic routing
+    ↓
+ActionRequest
+    ├─ DeterministicExecutor
+    └─ AgentExecutor -> Turn / Work
+                 ↓
+          CapabilityRegistry
+                 ↓
+              Authority
+                 ↓
+             Effect WAL
+                 ↓
+         durable Result/Receipt
+```
+
+Context is a projection of durable/runtime state, not a second owner of it.
+
+**Convergence rule.** One occurrence → local fix. A second occurrence →
+investigate the common root. A repeated family across modules → stop adding leaf
+mechanisms and build the missing primitive. A new feature-specific hook,
+registry, scheduler, retry loop, effect log or provider special case is suspect
+by default when the same behaviour can be represented through the waist.
+
+**Definition of convergence.** Adding one native capability takes one canonical
+definition/registration, not edits to several independent lists; adding an event
+takes one producer, not agent-loop surgery; deterministic automation and agentic
+automation use the same Action/Effect path; adding a surface does not invent
+identity or work semantics; self-inspection derives events, executors,
+capabilities and work from runtime truth rather than restating them.
+
+This document owns the shape and the convergence rule. Risk-adaptive execution
+(FAST / STANDARD / CRITICAL, subtraction economy) belongs to
+`docs/development/ORCHESTRATION.md`; research freshness and counterevidence
+belong to `docs/development/RESEARCH.md`.
 
 ## 10. Canonical state versus derived state
 

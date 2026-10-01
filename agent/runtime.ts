@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import type DatabaseCtor from 'better-sqlite3';
 import { ApprovalStore } from '../core/approvals/store.js';
 import { BudgetEngine } from '../core/budget/budget.js';
-import { costUsd } from '../core/budget/pricing.js';
+import { costUsd, isUnmeteredEndpoint } from '../core/budget/pricing.js';
 import {
   type Config,
   loadConfig,
@@ -16,6 +16,9 @@ import { tightenHome } from '../core/config/private-fs.js';
 import { resolveWorkspace } from '../core/config/workspace.js';
 import { migrate } from '../core/db/migrate.js';
 import { openDb } from '../core/db/open.js';
+import { makeShadowJudge, type ShadowJudge } from '../core/judgment/shadow.js';
+import { JudgmentStore } from '../core/judgment/store.js';
+import { TypeSafePort } from '../core/judgment/typesafe.js';
 import { loadMcpRegistry } from '../core/mcp/registry.js';
 import {
   CONSOLIDATION_CAPABILITY,
@@ -36,6 +39,7 @@ import type { CapabilityDecl } from '../core/policy/types.js';
 import { loadSealedBudgets } from '../core/rot/budgets.js';
 import { mandatoryGuards } from '../core/rot/guards.js';
 import { type HardeningCheck, hardeningHolds, verify } from '../core/rot/verify.js';
+import { Delega } from '../core/runtime/delega.js';
 import { SandboxExecutor } from '../core/sandbox/executor.js';
 import { assessShellBoundary } from '../core/sandbox/shell-boundary.js';
 import { JobFireStore } from '../core/scheduler/job-fires.js';
@@ -56,7 +60,13 @@ import {
   type SystemPromptBlocks,
 } from './context/assemble.js';
 import type { Approver, LoopDeps, RegisteredTool, SpendEntry, TurnRuntimeInfo } from './loop.js';
-import { loadProfiles, selectProfile, withThinking } from './profiles/profile.js';
+import {
+  CONSERVATIVE,
+  loadEffectiveProfiles,
+  selectSourcedProfile,
+  withThinking,
+  type ProfileOrigin,
+} from './profiles/profile.js';
 import { AnthropicProvider } from './providers/anthropic.js';
 import { type LightAttemptReport, lightLane } from './providers/light-lane.js';
 import { OpenAICompatProvider } from './providers/openai-compat.js';
@@ -599,21 +609,41 @@ export function buildRuntime(
           // dati, e sceglierla al posto suo qui sarebbe deciderla in silenzio.
           // Assente = quello che fa il gateway da sé; `muffin doctor` dice
           // cosa vuol dire.
-          source.provider.routing ? { routing: source.provider.routing } : {},
+          {
+            ...(source.provider.routing ? { routing: source.provider.routing } : {}),
+            ...(source.provider.reasoningDialect
+              ? { reasoningDialect: source.provider.reasoningDialect }
+              : {}),
+          },
         );
   let provider: Provider = createMainProvider(config);
   let providerFingerprint = JSON.stringify(config.provider);
   let lightFingerprint = JSON.stringify({ provider: config.provider, light: config.models.light });
 
   const profileProblems: string[] = [];
-  const profiles = loadProfiles(undefined, (line) => profileProblems.push(line));
+  const sourcedProfiles = loadEffectiveProfiles(home, undefined, (line) => profileProblems.push(line));
   // L'override dell'owner (`config.json` §thinking) sulla sola corsia di
   // conversazione: la light qui sotto tiene il profilo del *suo* modello, e le
   // corsie della memoria chiedono `off` da sé.
-  const profile = withThinking(selectProfile(config.models.main, profiles), config.thinking);
+  const mainSourced = selectSourcedProfile(config.models.main, sourcedProfiles);
+  const profile = withThinking(mainSourced?.profile ?? CONSERVATIVE, config.thinking);
+  // Provenance holder, mutated alongside `profile` on refresh: readers
+  // (`sys_inspect`, exposure remedies) hold this reference, never a copy —
+  // the same stability contract `profile` itself has below.
+  const profileSource: { origin: ProfileOrigin | 'conservative'; file: string } =
+    mainSourced === undefined
+      ? { origin: 'conservative' as const, file: '' }
+      : { origin: mainSourced.origin, file: mainSourced.file };
 
   const recordSpendWithBaseUrl = (entry: SpendEntry, baseUrl: string | undefined): number => {
-    const usd = costUsd(entry.model, entry, baseUrl);
+    // An owner-declared unmetered endpoint skips the meter entirely: the
+    // machine behind it is funded outside the spend caps, so the served model
+    // and the requested route both stop mattering here. Only the sealed list
+    // decides — a model-reachable config.json never reaches this branch (#499).
+    const usd =
+      baseUrl !== undefined && isUnmeteredEndpoint(baseUrl, budgets.unmetered)
+        ? 0
+        : costUsd(entry.model, entry, baseUrl, entry.requestedModel);
     // `entry` porta già `jobId` quando il turno è il giro di un job
     // (`agent/loop.ts`), e lo spread lo passa dritto alla riga di `spend`:
     // niente da tenere in sincrono qui, e nessun secondo posto in cui
@@ -659,7 +689,7 @@ export function buildRuntime(
     span.end();
   };
   let light = lightLane(provider, {
-    profile: selectProfile(config.models.light, profiles),
+    profile: selectSourcedProfile(config.models.light, sourcedProfiles)?.profile ?? CONSERVATIVE,
     record: (entry) =>
       void recordSpendWithBaseUrl(
         {
@@ -1027,6 +1057,58 @@ export function buildRuntime(
   const closeHooks: Array<() => Promise<void>> = [];
   const approvers = new Map<string, Approver>();
   const approvals = new ApprovalStore(db);
+  /**
+   * La delega dell'owner (issue #740), sullo stesso handle di tutto il resto
+   * (ADR-0022): il loop la legge a ogni ask, i comandi la scrivono, e un
+   * processo solo non è mai la verità.
+   */
+  const delega = new Delega(db);
+
+  /**
+   * System One in shadow (issue #740, fase 1; ADR-0096). Costruito **solo**
+   * se la config nomina il giudice e il segreto risponde: in ogni altro
+   * caso `LoopDeps.judgment` resta `undefined`, il ramo `ask` è quello di
+   * sempre e nessun byte parte dalla macchina. Un segreto mancato non è
+   * un errore di avvio — è una riga fra le `bootLines`, come ogni
+   * capability accesa e non raggiungibile.
+   *
+   * La coda vive sullo stesso handle del resto (ADR-0022), e i giudizi in
+   * volo alla chiusura restano `pending`: la riga lo dice, il report lo
+   * conta, e nessuno interpreta il buco come un verdetto.
+   */
+  const judgmentNotes: string[] = [];
+  let judgment: ShadowJudge | undefined;
+  if (config.judgment !== undefined) {
+    const chiave = (() => {
+      try {
+        return readSecret(config.judgment.apiKeyRef, home);
+      } catch {
+        return null;
+      }
+    })();
+    if (chiave === null) {
+      judgmentNotes.push(
+        '! system one: config presente ma il segreto manca — nessun giudizio shadow',
+      );
+    } else {
+      judgment = makeShadowJudge({
+        port: new TypeSafePort({
+          apiKey: chiave,
+          ...(config.judgment.baseUrl === undefined ? {} : { baseUrl: config.judgment.baseUrl }),
+          ...(config.judgment.model === undefined ? {} : { model: config.judgment.model }),
+          ...(config.judgment.timeoutMs === undefined
+            ? {}
+            : { timeoutMs: config.judgment.timeoutMs }),
+          ...(config.judgment.maxRetries === undefined
+            ? {}
+            : { maxRetries: config.judgment.maxRetries }),
+        }),
+        store: new JudgmentStore(db),
+        tracer,
+        log: opts.log ?? ((line) => process.stderr.write(`${line}\n`)),
+      });
+    }
+  }
 
   /**
    * Test-only override of the trailing-edge debounce, a no-op unless a
@@ -1140,6 +1222,15 @@ export function buildRuntime(
       doctor: async () => (await import('../cli/doctor.js')).runDoctor(home),
       turns: () => turns.health({ windowMs: 0 }),
       jobs: () => jobs.list(),
+      // La postura di delega del lavoro che sta chiedendo (issue #740): la
+      // stessa riga che il ramo ask del loop legge, così `sys_inspect` non ha
+      // una seconda risposta su «in che modalità sono».
+      delega: (turnId: string) => ({ modo: delega.modo(turnId), dal: delega.da(turnId) }),
+      // System One, se attivo: visibile a `sys_inspect` come tutto il resto
+      // della postura — mai una seconda fonte, la stessa istanza del loop.
+      ...(judgment === undefined
+        ? {}
+        : { judgment: () => ({ provider: judgment.provider, model: judgment.model }) }),
     }),
   );
 
@@ -1201,6 +1292,8 @@ export function buildRuntime(
           tool,
           profileName: profile.name,
           maxToolsExposed: profile.maxToolsExposed,
+          profileOrigin: profileSource.origin,
+          profileFile: profileSource.file === '' ? undefined : profileSource.file,
         }),
       );
     }
@@ -1216,8 +1309,9 @@ export function buildRuntime(
       providerFingerprint = fingerprint;
     }
 
+    const refreshed = selectSourcedProfile(persisted.models.main, loadEffectiveProfiles(home));
     const nextProfile = withThinking(
-      selectProfile(persisted.models.main, loadProfiles()),
+      refreshed?.profile ?? CONSERVATIVE,
       persisted.thinking,
     );
     // Keep the config and profile objects stable for their existing readers
@@ -1229,6 +1323,12 @@ export function buildRuntime(
       thinking: persisted.thinking,
     });
     Object.assign(profile, nextProfile);
+    Object.assign(
+      profileSource,
+      refreshed === undefined
+        ? { origin: 'conservative' as const, file: '' }
+        : { origin: refreshed.origin, file: refreshed.file },
+    );
     recordSpend = makeRecordSpend(persisted.provider.baseUrl);
     if (loopDeps !== null) {
       loopDeps.provider = provider;
@@ -1240,6 +1340,7 @@ export function buildRuntime(
         mainModel: persisted.models.main,
         lightModel: persisted.models.light,
         profile,
+        profileSource,
       };
     }
     computeExposureGaps();
@@ -1265,7 +1366,7 @@ export function buildRuntime(
     lightFingerprint = fingerprint;
     lightBaseUrl = persisted.provider.baseUrl;
     light = lightLane(provider, {
-      profile: selectProfile(persisted.models.light, profiles),
+      profile: selectSourcedProfile(persisted.models.light, sourcedProfiles)?.profile ?? CONSERVATIVE,
       record: (entry) =>
         void recordSpendWithBaseUrl(
           {
@@ -1338,6 +1439,7 @@ export function buildRuntime(
       ...budgetNotes,
       ...rotNotes,
       ...configNotes,
+      ...judgmentNotes,
     ],
     register: (tool, decl) => {
       capabilities.set(decl.id, decl);
@@ -1366,6 +1468,7 @@ export function buildRuntime(
         mainModel: config.models.main,
         lightModel: config.models.light,
         profile,
+        profileSource,
       } satisfies TurnRuntimeInfo,
       provider,
       profile,
@@ -1387,6 +1490,12 @@ export function buildRuntime(
       // suo in `runtime.test.ts`, non solo il ramo nel loop.
       undo: new UndoJournal(p.undo),
       approvals,
+      // La postura che consuma gli ask di ogni lavoro: letta fresca dal
+      // registro a ogni domanda, mai copiata in memoria (issue #740).
+      delega,
+      // System One in shadow (issue #740 fase 1): presente solo quando la
+      // config e il segreto lo dicono — assente, il ramo ask non cambia.
+      ...(judgment === undefined ? {} : { judgment }),
       /**
        * L'instradatore, e il fatto che sia qui e non su una superficie è la
        * proprietà: chi chiede è **la superficie da cui il turno è arrivato**,

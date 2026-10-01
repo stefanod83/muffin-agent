@@ -4,11 +4,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { COMANDI } from '../../agent/comandi.js';
+import type { Controlli } from '../../agent/comandi.js';
 import type { LoopDeps } from '../../agent/loop.js';
 import type { ChatResult, Provider } from '../../agent/providers/types.js';
 import { buildRuntime } from '../../agent/runtime.js';
 import { runInit } from '../../cli/init.js';
 import type { TelegramApi } from './api.js';
+import { TelegramError } from './api.js';
+import { TELEGRAM_MAX } from './render.js';
 import { TelegramConnector } from './connector.js';
 import { ModelLane } from '../../core/turns/model-lane.js';
 import { TelegramDeliveryStore } from './delivery.js';
@@ -46,7 +49,8 @@ function harness(comandi?: (riga: string, sessionId: string) => Promise<{ testo:
   runInit({ home, apiKey: 'sk-comandi-never-called' });
   const runtime = buildRuntime(home, workspace);
 
-  const sent: { chatId: number; text: string; replyTo?: number }[] = [];
+  const sent: { method: string; chatId: number; text: string; replyTo?: number }[] = [];
+  const failRich = { value: false };
   const turns: string[] = [];
   const menu: { command: string; description: string }[][] = [];
   const controller = new AbortController();
@@ -64,7 +68,14 @@ function harness(comandi?: (riga: string, sessionId: string) => Promise<{ testo:
       return true;
     },
     sendMessage: async (chatId: number, text: string, options?: { replyTo?: number }) => {
-      sent.push({ chatId, text, ...(options?.replyTo === undefined ? {} : { replyTo: options.replyTo }) });
+      sent.push({ method: 'sendMessage', chatId, text, ...(options?.replyTo === undefined ? {} : { replyTo: options.replyTo }) });
+      return {} as never;
+    },
+    // La lane rich si registra come il suo gemello legacy; con `failRich` il
+    // rifiuto è deterministico e `present` scende ai pezzi sotto il limite.
+    sendRichMessage: async (chatId: number, rich: { html?: string; blocks?: unknown[] }, options?: { replyTo?: number }) => {
+      if (failRich.value) throw new TelegramError(400, 'Bad Request: ricco rifiutato (simulato)');
+      sent.push({ method: 'sendRichMessage', chatId, text: rich.html ?? JSON.stringify(rich.blocks ?? []), ...(options?.replyTo === undefined ? {} : { replyTo: options.replyTo }) });
       return {} as never;
     },
     sendChatAction: async () => true,
@@ -97,8 +108,11 @@ function harness(comandi?: (riga: string, sessionId: string) => Promise<{ testo:
     api,
     config: { token: 't', ownerUserId: OWNER, ownerChatId: OWNER },
     ...(comandi ? { comandi } : {}),
+    // Come `cli/surface.ts`: senza registro i pulsanti non si mandano e la
+    // leva di delega non si costruisce — l'harness deve dirlo come la produzione.
+    ...(runtime.deps.approvals === undefined ? {} : { approvals: runtime.deps.approvals }),
   });
-  return { connector, sent, turns, menu, controller };
+  return { connector, sent, turns, menu, controller, failRich, runtime };
 }
 
 async function deliver(h: ReturnType<typeof harness>, updates: Update[]): Promise<void> {
@@ -118,6 +132,9 @@ describe('un comando dell owner non passa dal modello', () => {
     await deliver(h, [msg(1, { chatId: OWNER, fromId: OWNER, text: '/spend' })]);
 
     expect(h.turns).toEqual([]);
+    // La risposta dei comandi esce dalla lane ricca: è la policy, non un
+    // `sendMessage` che per caso dice le stesse parole.
+    expect(h.sent[0]?.method).toBe('sendRichMessage');
     expect(h.sent[0]?.text).toContain('$0.0031');
     // La sessione è quella che il turno aprirebbe, e da ADR-0056 per la DM
     // dell'owner è `owner`: `/new` da qui deve archiviare la conversazione che
@@ -139,20 +156,34 @@ describe('un comando dell owner non passa dal modello', () => {
   /**
    * `/model --list` supera i 4096 caratteri con una manciata di modelli.
    * Mandare solo il primo pezzo sarebbe un elenco troncato in silenzio — che
-   * è esattamente il difetto che `renderForTelegram` esiste per non avere.
+   * è esattamente il difetto che `renderForTelegram`/`splitHtml` esistono per
+   * non avere. Sotto il tetto di compatibilità (8192) la risposta intera sta
+   * in un messaggio ricco; se il ricco viene rifiutato — o il testo lo
+   * supera — scende ai pezzi legacy, mai troncata.
    */
-  it('e una risposta lunga arriva tutta, non solo il primo pezzo', async () => {
-    const lunga = Array.from({ length: 400 }, (_, i) => `riga numero ${i} del catalogo dei modelli`).join('\n');
+  it('e una risposta lunga arriva tutta — ricca in un messaggio, o a pezzi sotto il limite', async () => {
+    const lunga = Array.from({ length: 150 }, (_, i) => `riga numero ${i} del catalogo dei modelli`).join('\n');
     const h = harness(async () => ({ testo: lunga }));
 
     await deliver(h, [msg(1, { chatId: OWNER, fromId: OWNER, text: '/model --list' })]);
 
-    expect(h.sent.length).toBeGreaterThan(1);
-    expect(h.sent.map((s) => s.text).join('')).toContain('riga numero 399');
-    // La citazione sta sul primo pezzo soltanto: citarne cinque sarebbe cinque
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0]?.method).toBe('sendRichMessage');
+    expect(h.sent[0]?.text).toContain('riga numero 149');
+    // La citazione sta su un pezzo soltanto: citarne cinque sarebbe cinque
     // risposte alla stessa domanda.
     expect(h.sent.filter((s) => s.replyTo !== undefined)).toHaveLength(1);
     expect(h.sent[0]?.replyTo).toBe(1);
+
+    const h2 = harness(async () => ({ testo: lunga }));
+    h2.failRich.value = true;
+    await deliver(h2, [msg(1, { chatId: OWNER, fromId: OWNER, text: '/model --list' })]);
+
+    expect(h2.sent.length).toBeGreaterThan(1);
+    for (const s of h2.sent) expect(s.text.length).toBeLessThanOrEqual(TELEGRAM_MAX);
+    expect(h2.sent.map((s) => s.text).join('')).toContain('riga numero 149');
+    expect(h2.sent.filter((s) => s.replyTo !== undefined)).toHaveLength(1);
+    expect(h2.sent[0]?.replyTo).toBe(1);
   });
 });
 
@@ -221,5 +252,84 @@ describe('il menu dei comandi lo dichiara l avvio', () => {
     };
 
     await expect(h.connector.run(h.controller.signal)).resolves.toBeUndefined();
+  });
+});
+
+describe('/yolo dal telefono: la leva è vera, e solo dell owner', () => {
+  /**
+   * Il fake non decide: cattura i controlli che il connettore passa ai
+   * comandi veri, così qui si prova che `tryCommand` costruisce la leva sugli
+   * store del loop — non che `eseguiComando` sa leggere una leva (quello sta
+   * in `agent/comandi.test.ts`).
+   */
+  type Visto = { riga: string; controlli: Controlli };
+  const leve = () => {
+    const visti: Visto[] = [];
+    const comandi = async (riga: string, _sessione: string, controlli?: Controlli) => {
+      visti.push({ riga, controlli: controlli! });
+      return { testo: 'ok' };
+    };
+    return { visti, comandi };
+  };
+
+  const accodaLavoro = (h: ReturnType<typeof harness>) =>
+    h.runtime.deps.turns.enqueue({
+      id: 'lavoro-in-corso',
+      principal: { kind: 'owner', connector: 'telegram', externalId: String(OWNER) },
+      tenant: 'host',
+      surface: 'telegram',
+      sessionId: 'owner',
+      model: 'm',
+      messages: [],
+      taint: 0,
+      counters: {
+        iterations: 0,
+        recoveriesUsed: 0,
+        transportRetriesLeft: 2,
+        truncationsUsed: 0,
+        toolCallsMade: 0,
+        nudgedForCompletion: false,
+        usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+        spentUsd: 0,
+        resumes: 0,
+        contextBuilt: false,
+      },
+    });
+
+  it('la leva arriva ai comandi e si lega al lavoro della conversazione', async () => {
+    const l = leve();
+    const h = harness(l.comandi);
+    accodaLavoro(h);
+
+    await deliver(h, [msg(1, { chatId: OWNER, fromId: OWNER, text: '/yolo' })]);
+
+    expect(h.turns).toEqual([]);
+    expect(l.visti).toHaveLength(1);
+    const esito = l.visti[0]!.controlli.delega?.metti('yolo');
+    expect(esito?.turnId).toBe('lavoro-in-corso');
+    expect(h.runtime.deps.delega?.modo('lavoro-in-corso')).toBe('yolo');
+  });
+
+  it('senza lavoro la leva c è ma non lega niente', async () => {
+    const l = leve();
+    const h = harness(l.comandi);
+
+    await deliver(h, [msg(1, { chatId: OWNER, fromId: OWNER, text: '/yolo' })]);
+
+    expect(h.turns).toEqual([]);
+    expect(l.visti[0]!.controlli.delega).toBeDefined();
+    expect(l.visti[0]!.controlli.delega?.metti('yolo')).toBeNull();
+  });
+
+  it('un estraneo non riceve leve e il testo va al modello', async () => {
+    const l = leve();
+    const h = harness(l.comandi);
+    accodaLavoro(h);
+
+    await deliver(h, [msg(1, { chatId: -900, fromId: STRANGER, text: '/yolo', type: 'supergroup' })]);
+
+    expect(l.visti).toEqual([]);
+    expect(h.turns).toEqual(['turn ran']);
+    expect(h.runtime.deps.delega?.modo('lavoro-in-corso')).toBe('manual');
   });
 });
